@@ -17,6 +17,7 @@ const showAdvanced = ref(false);
 const invoke = window.__TAURI__.core.invoke;
 
 // 计算是否为精确哈希算法
+// 检查是否为精确算法
 const isExactAlgorithm = computed(() => algorithm.value === "Exact");
 
 // 初始化状态
@@ -442,7 +443,7 @@ const toggleAdvanced = () => {
                     </div>
 
                     <!-- 相似度阈值 -->
-                    <div class="mb-5" v-if="!isExactAlgorithm">
+                    <div class="mb-5" :class="{'opacity-50': isExactAlgorithm}">
                         <label
                             class="block text-lg font-semibold text-slate-800 mb-3 flex items-center gap-2 group"
                         >
@@ -483,6 +484,7 @@ const toggleAdvanced = () => {
                                 max="100"
                                 step="1"
                                 class="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer"
+                                :disabled="isExactAlgorithm"
                             />
                             <div
                                 class="flex justify-between text-sm text-slate-600 mt-3 font-medium"
@@ -892,7 +894,7 @@ const toggleAdvanced = () => {
                     </div>
 
                     <!-- 相似度阈值 -->
-                    <div class="mb-5 pb-5 border-b border-slate-200" v-if="!isExactAlgorithm">
+                    <div class="mb-5 pb-5 border-b border-slate-200" :class="{'opacity-50': isExactAlgorithm}">
                         <label
                             class="block mb-2 font-medium text-slate-800 flex items-center gap-2"
                         >
@@ -928,6 +930,7 @@ const toggleAdvanced = () => {
                                 max="100"
                                 step="1"
                                 class="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer"
+                                :disabled="isExactAlgorithm"
                             />
                             <div
                                 class="flex justify-between text-xs text-slate-500 mt-2 font-medium"

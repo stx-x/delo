@@ -37,6 +37,11 @@ pub fn get_image_paths(dir_path: &Path, recursive: bool) -> Result<Vec<PathBuf>,
             .filter_map(|e| e.ok())
         {
             let path = entry.path();
+            // 跳过符号链接
+            if path.is_symlink() {
+                continue;
+            }
+            
             if path.is_file() && is_image_file(path) {
                 image_paths.push(path.to_path_buf());
             }
@@ -46,6 +51,11 @@ pub fn get_image_paths(dir_path: &Path, recursive: bool) -> Result<Vec<PathBuf>,
         if let Ok(entries) = fs::read_dir(dir_path) {
             for entry in entries.filter_map(|e| e.ok()) {
                 let path = entry.path();
+                // 跳过符号链接
+                if path.is_symlink() {
+                    continue;
+                }
+                
                 if path.is_file() && is_image_file(&path) {
                     image_paths.push(path);
                 }
@@ -58,6 +68,11 @@ pub fn get_image_paths(dir_path: &Path, recursive: bool) -> Result<Vec<PathBuf>,
 
 /// 获取文件的元数据信息
 pub fn get_file_metadata(path: &Path) -> Result<(u64, String, String), String> {
+    // 检查是否是符号链接
+    if path.is_symlink() {
+        return Err(format!("文件是符号链接: {}", path.display()));
+    }
+    
     let metadata = fs::metadata(path)
         .map_err(|e| format!("无法读取文件元数据: {}", e))?;
     

@@ -128,6 +128,11 @@ pub fn get_folder_stats(folder_path: String, recursive: bool) -> Result<FolderSt
             if let Ok(entry) = entry {
                 let path = entry.path();
                 
+                // 跳过符号链接
+                if path.is_symlink() {
+                    continue;
+                }
+                
                 if path.is_file() {
                     stats.total_files += 1;
                     

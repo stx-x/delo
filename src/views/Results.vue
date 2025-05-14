@@ -28,6 +28,87 @@ const state = ref({
     },
 });
 
+// 设置面板状态
+const showSettings = ref(false);
+const newAlgorithm = ref(globalState.algorithm || 'Exact');
+const newThreshold = ref(globalState.similarityThreshold || 80);
+const newFolders = ref([...globalState.selectedFolders || []]);
+const newRecursive = ref(globalState.recursive !== undefined ? globalState.recursive : true);
+const isRescanning = ref(false);
+
+// 算法列表
+const algorithms = [
+    { id: 'Exact', name: '精确哈希' },
+    { id: 'Average', name: '均值哈希' },
+    { id: 'Difference', name: '差值哈希' },
+    { id: 'Perceptual', name: '感知哈希' },
+    { id: 'ORB', name: 'ORB特征' }
+];
+
+// 打开文件夹选择对话框
+const openFolderDialog = async () => {
+    try {
+        const selected = await window.__TAURI__.dialog.open({
+            directory: true,
+            multiple: true,
+            title: "选择文件夹（按住 Ctrl/Command 键可选择多个）",
+        });
+
+        if (Array.isArray(selected)) {
+            // 过滤已选择的文件夹
+            const filteredFolders = selected.filter(
+                folder => !newFolders.value.includes(folder)
+            );
+            
+            if (filteredFolders.length > 0) {
+                newFolders.value = [...newFolders.value, ...filteredFolders];
+            }
+        } else if (selected && !newFolders.value.includes(selected)) {
+            newFolders.value.push(selected);
+        }
+    } catch (err) {
+        console.error("选择文件夹时出错：", err);
+    }
+};
+
+// 重新扫描
+const rescan = async () => {
+    if (newFolders.value.length === 0 || isRescanning.value) {
+        return;
+    }
+    
+    isRescanning.value = true;
+    showSettings.value = false;
+    state.value.processingStatus = "正在重新扫描...";
+    
+    try {
+        // 准备请求参数
+        const duplicateGroups = await window.__TAURI__.core.invoke("find_duplicates", {
+            req: {
+                folder_paths: newFolders.value,
+                algorithm: newAlgorithm.value,
+                similarity_threshold: Number(newThreshold.value),
+                recursive: newRecursive.value,
+            },
+        });
+
+        // 更新全局状态
+        globalState.duplicateGroups = duplicateGroups;
+        globalState.selectedFolders = [...newFolders.value];
+        globalState.algorithm = newAlgorithm.value;
+        globalState.similarityThreshold = newThreshold.value;
+        globalState.recursive = newRecursive.value;
+        
+        // 重新加载数据
+        loadData();
+    } catch (err) {
+        console.error("重新扫描出错：", err);
+        state.value.processingStatus = `重新扫描出错: ${err}`;
+    } finally {
+        isRescanning.value = false;
+    }
+};
+
 // 计算属性
 const selectedCount = computed(() => {
     return Object.values(state.value.selectedImages).reduce((count, group) => {
@@ -72,6 +153,8 @@ const groupNavVisible = ref(false);
 
 // 是否在页面底部
 const isAtBottom = ref(false);
+// 鼠标是否悬停在底部导航按钮上
+const isHoveringBottomNav = ref(false);
 
 // 监听窗口大小变化和滚动事件，更新底部检测
 onMounted(() => {
@@ -132,6 +215,11 @@ const updateCurrentVisibleGroup = () => {
 // 滚动到顶部
 const scrollToTop = () => {
     window.scrollTo({ top: 0, behavior: 'smooth' });
+    
+    // 在动画完成后检测位置以更新按钮状态
+    setTimeout(() => {
+        handleScroll();
+    }, 1000);
 };
 
 // 显示分组导航
@@ -151,6 +239,11 @@ const scrollToBottom = () => {
         top: document.documentElement.scrollHeight, 
         behavior: 'smooth' 
     });
+    
+    // 在动画完成后检测位置以更新按钮状态
+    setTimeout(() => {
+        handleScroll();
+    }, 1000);
 };
 
 // 加载数据
@@ -733,14 +826,28 @@ const processGroup = (group) => {
         transform: translateX(-20px);
     }
 }
+@keyframes pulse {
+    0% {
+        box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.4);
+    }
+    70% {
+        box-shadow: 0 0 0 6px rgba(59, 130, 246, 0);
+    }
+    100% {
+        box-shadow: 0 0 0 0 rgba(59, 130, 246, 0);
+    }
+}
 .animate-fade-in {
     animation: fadeIn 0.5s ease forwards;
 }
 .animate-slide-in {
-    animation: slideIn 0.3s ease forwards;
+    animation: slideIn 0.3s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
 }
 .animate-slide-out {
-    animation: slideOut 0.3s ease forwards;
+    animation: slideOut 0.3s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+}
+.animate-pulse {
+    animation: pulse 2s infinite;
 }
 .fade-enter-active, .fade-leave-active {
     transition: opacity 0.3s, transform 0.3s;
@@ -769,7 +876,133 @@ const processGroup = (group) => {
 </style>
 
 <template>
-    <main class="p-8 max-w-7xl mx-auto">
+    <main class="p-8 max-w-7xl mx-auto relative">
+        <!-- 调整参数快捷菜单 -->
+        <div class="fixed right-6 top-6 z-40">
+            <button 
+                class="bg-white p-3 rounded-full shadow-lg hover:bg-slate-50 hover:text-blue-600 transform hover:scale-105 active:scale-95 transition-all duration-300 text-slate-600"
+                title="调整扫描参数"
+                @click="showSettings = !showSettings"
+            >
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"></path>
+                    <circle cx="12" cy="12" r="3"></circle>
+                </svg>
+            </button>
+            
+            <!-- 设置面板 -->
+            <transition
+                enter-active-class="transition ease-out duration-300 transform"
+                enter-from-class="opacity-0 scale-95 translate-y-2"
+                enter-to-class="opacity-100 scale-100 translate-y-0"
+                leave-active-class="transition ease-in duration-200 transform"
+                leave-from-class="opacity-100 scale-100 translate-y-0"
+                leave-to-class="opacity-0 scale-95 translate-y-2"
+            >
+                <div v-if="showSettings" class="absolute top-14 right-0 w-80 bg-white rounded-xl shadow-xl border border-slate-200 overflow-hidden">
+                    <div class="p-4 bg-slate-50 border-b border-slate-200">
+                        <h3 class="text-lg font-semibold text-slate-800">调整扫描参数</h3>
+                        <p class="text-sm text-slate-600">修改后点击"重新扫描"应用更改</p>
+                    </div>
+                    <div class="p-4">
+                        <!-- 算法选择 -->
+                        <div class="mb-4">
+                            <label class="block text-sm font-medium text-slate-700 mb-2">
+                                检测算法
+                            </label>
+                            <select 
+                                v-model="newAlgorithm" 
+                                class="w-full p-2 border border-slate-300 rounded-lg bg-white focus:border-blue-500 focus:ring-2 focus:ring-blue-200 shadow-sm"
+                            >
+                                <option v-for="algo in algorithms" :key="algo.id" :value="algo.id">{{ algo.name }}</option>
+                            </select>
+                        </div>
+                        
+                        <!-- 相似度阈值 -->
+                        <div class="mb-4" v-if="newAlgorithm !== 'Exact'">
+                            <label class="block text-sm font-medium text-slate-700 mb-2">
+                                相似度阈值: {{ newThreshold }}%
+                            </label>
+                            <input 
+                                type="range" 
+                                v-model="newThreshold" 
+                                min="0" 
+                                max="100" 
+                                step="1"
+                                class="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer"
+                            />
+                        </div>
+                        
+                        <!-- 文件夹选择 -->
+                        <div class="mb-4">
+                            <label class="block text-sm font-medium text-slate-700 mb-2">
+                                当前文件夹
+                            </label>
+                            <div class="max-h-32 overflow-y-auto scrollbar-thin mb-2 border border-slate-200 rounded-lg">
+                                <div 
+                                    v-for="(folder, index) in newFolders" 
+                                    :key="index"
+                                    class="flex items-center justify-between bg-white p-2 rounded mb-1 text-sm border-b border-slate-100 last:border-b-0"
+                                >
+                                    <div class="truncate text-slate-600">{{ folder }}</div>
+                                    <button 
+                                        @click="newFolders.splice(index, 1)"
+                                        class="text-red-500 hover:text-red-700"
+                                    >
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <line x1="18" y1="6" x2="6" y2="18"></line>
+                                            <line x1="6" y1="6" x2="18" y2="18"></line>
+                                        </svg>
+                                    </button>
+                                </div>
+                            </div>
+                            <button 
+                                @click="openFolderDialog"
+                                class="w-full py-2 bg-slate-100 text-slate-700 rounded-lg hover:bg-slate-200 transition-colors flex items-center justify-center gap-2 shadow-sm transform hover:-translate-y-0.5 active:translate-y-0 duration-300"
+                            >
+                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M5 4h4l3 3h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"></path>
+                                    <line x1="12" y1="11" x2="12" y2="17"></line>
+                                    <line x1="9" y1="14" x2="15" y2="14"></line>
+                                </svg>
+                                添加文件夹
+                            </button>
+                        </div>
+                        
+                        <!-- 递归选项 -->
+                        <div class="mb-6 flex items-center gap-2">
+                            <input 
+                                type="checkbox" 
+                                id="recursive-checkbox" 
+                                v-model="newRecursive"
+                                class="rounded border-slate-300 text-slate-700 focus:ring-slate-500"
+                            />
+                            <label for="recursive-checkbox" class="text-sm text-slate-700">
+                                包含子文件夹
+                            </label>
+                        </div>
+                        
+                        <!-- 操作按钮 -->
+                        <div class="flex justify-between">
+                            <button 
+                                @click="showSettings = false"
+                                class="px-4 py-2 bg-slate-100 text-slate-700 rounded-lg hover:bg-slate-200 transform hover:-translate-y-0.5 active:translate-y-0 transition-all duration-300 shadow-sm"
+                            >
+                                取消
+                            </button>
+                            <button 
+                                @click="rescan"
+                                class="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transform hover:-translate-y-0.5 active:translate-y-0 transition-all duration-300 shadow-sm disabled:bg-blue-300 disabled:cursor-not-allowed disabled:transform-none"
+                                :disabled="newFolders.length === 0 || isRescanning"
+                            >
+                                <span v-if="isRescanning">扫描中...</span>
+                                <span v-else>重新扫描</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </transition>
+        </div>
         <div class="w-full">
             <div class="flex items-center mb-8 gap-4">
                 <button
@@ -913,7 +1146,7 @@ const processGroup = (group) => {
                                     <p class="text-lg font-semibold">{{ globalState.algorithm }}</p>
                                 </div>
                             </div>
-                            <div class="bg-white p-3 rounded-lg shadow-sm flex items-center gap-3" v-if="globalState.algorithm !== 'Exact'">
+                            <div class="bg-white p-3 rounded-lg shadow-sm flex items-center gap-3">
                                 <div class="bg-teal-100 p-2 rounded-lg">
                                     <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-teal-600">
                                         <path d="M2 12h10"></path>
@@ -923,8 +1156,8 @@ const processGroup = (group) => {
                                     </svg>
                                 </div>
                                 <div>
-                                    <p class="text-xs text-slate-500">相似度阈值</p>
-                                    <p class="text-lg font-semibold">{{ globalState.similarityThreshold }}%</p>
+                                    <p class="text-xs text-slate-500">{{ globalState.algorithm === 'Exact' ? '重复组数' : '相似度阈值' }}</p>
+                                    <p class="text-lg font-semibold">{{ globalState.algorithm === 'Exact' ? state.duplicateGroups.length : globalState.similarityThreshold + '%' }}</p>
                                 </div>
                             </div>
                         </div>
@@ -1488,34 +1721,52 @@ const processGroup = (group) => {
             </div>
         </div>
         <!-- 顶部/底部导航按钮 -->
-        <div class="fixed right-6 bottom-6 flex flex-col gap-3 z-40">
-                    <transition name="fade">
-                        <button 
-                            v-if="state.showBackToTop && !groupNavVisible"
-                            @click="scrollToTop"
-                            class="bg-white w-12 h-12 rounded-full shadow-lg flex items-center justify-center text-slate-600 hover:bg-slate-50 hover:text-blue-600 transform hover:scale-110 transition-all duration-300"
-                            title="返回顶部"
-                            aria-label="返回顶部"
-                        >
-                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                <path d="m18 15-6-6-6 6"/>
-                            </svg>
-                        </button>
-                    </transition>
-                    <transition name="fade">
-                        <button 
-                            v-if="!isAtBottom && state.duplicateGroups.length > 0 && !groupNavVisible"
-                            @click="scrollToBottom"
-                            class="bg-white w-12 h-12 rounded-full shadow-lg flex items-center justify-center text-slate-600 hover:bg-slate-50 hover:text-blue-600 transform hover:scale-110 transition-all duration-300"
-                            title="滚动到底部"
-                            aria-label="滚动到底部"
-                        >
-                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                <path d="m6 9 6 6 6-6"/>
-                            </svg>
-                        </button>
-                    </transition>
-                </div>
+        <div class="fixed right-6 bottom-6 z-40">
+            <div class="flex flex-col gap-3 items-center">
+                <transition 
+                   enter-active-class="transition ease-out duration-300 transform"
+                   enter-from-class="opacity-0 translate-y-2 scale-95"
+                   enter-to-class="opacity-100 translate-y-0 scale-100"
+                   leave-active-class="transition ease-in duration-300 transform"
+                   leave-from-class="opacity-100 translate-y-0 scale-100"
+                   leave-to-class="opacity-0 translate-y-2 scale-95"
+                >
+                   <button 
+                       v-if="state.showBackToTop && !groupNavVisible"
+                       @click="scrollToTop"
+                       class="bg-white w-12 h-12 rounded-full shadow-lg flex items-center justify-center text-slate-600 hover:bg-slate-50 hover:text-blue-600 transform hover:scale-110 active:scale-95 transition-all duration-300"
+                       title="返回顶部"
+                       aria-label="返回顶部"
+                   >
+                       <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                           <path d="m18 15-6-6-6 6"/>
+                       </svg>
+                   </button>
+                </transition>
+                <transition 
+                    enter-active-class="transition ease-out duration-300 transform"
+                    enter-from-class="opacity-0 translate-y-2 scale-95"
+                    enter-to-class="opacity-100 translate-y-0 scale-100"
+                    leave-active-class="transition ease-in duration-300 transform"
+                    leave-from-class="opacity-100 translate-y-0 scale-100"
+                    leave-to-class="opacity-0 translate-y-2 scale-95"
+                >
+                    <button 
+                        v-if="(!isAtBottom || isHoveringBottomNav) && state.duplicateGroups.length > 0 && !groupNavVisible"
+                        @click="scrollToBottom"
+                        class="bg-white w-12 h-12 rounded-full shadow-lg flex items-center justify-center text-slate-600 hover:bg-slate-50 hover:text-blue-600 transform hover:scale-110 active:scale-95 transition-all duration-300"
+                        title="滚动到底部"
+                        aria-label="滚动到底部"
+                        @mouseenter="isHoveringBottomNav = true"
+                        @mouseleave="setTimeout(() => { isHoveringBottomNav = false }, 300)"
+                    >
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="m6 9 6 6 6-6"/>
+                        </svg>
+                    </button>
+                </transition>
+            </div>
+        </div>
         
         <!-- 分组悬浮导航（滚动时显示） -->
         <div
@@ -1524,14 +1775,19 @@ const processGroup = (group) => {
             @mouseenter="showGroupNav"
             @mouseleave="hideGroupNav"
         >
-            <div v-if="!groupNavVisible && state.showGroupNav" class="bg-white rounded-full shadow-xl p-3 border border-slate-200 cursor-pointer hover:bg-blue-50 transition-all duration-300 animate-fade-in" @click="showGroupNav">
+            <div v-if="!groupNavVisible && state.showGroupNav" 
+                class="bg-white rounded-full shadow-xl p-3 border border-slate-200 cursor-pointer hover:bg-blue-50 transition-all duration-300 transform hover:scale-110 active:scale-95 animate-pulse" 
+                @click="showGroupNav"
+                title="打开分组导航菜单">
                 <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-blue-600">
                     <path d="M3 9h18v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9Z"></path>
                     <path d="m3 9 2.45-4.9A2 2 0 0 1 7.24 3h9.52a2 2 0 0 1 1.8 1.1L21 9"></path>
                     <path d="M12 3v6"></path>
                 </svg>
             </div>
-            <div v-else-if="groupNavVisible" class="bg-white rounded-xl shadow-xl p-4 border border-slate-200 animate-slide-in transition-all duration-300">
+            <div v-else-if="groupNavVisible" 
+                 class="bg-white rounded-xl shadow-xl p-4 border border-slate-200 transition-all duration-300"
+                 :class="{'animate-slide-in': groupNavVisible}">
                 <h3 class="text-sm font-medium text-slate-700 mb-3 px-1 flex items-center justify-between">
                     <span>分组导航</span> 
                     <span class="text-xs bg-blue-50 text-blue-600 px-2 py-0.5 rounded-full">共{{ state.duplicateGroups.length }}组</span>
