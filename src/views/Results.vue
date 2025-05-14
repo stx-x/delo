@@ -33,7 +33,8 @@ const showSettings = ref(false);
 const newAlgorithm = ref(globalState.algorithm || 'Exact');
 const newThreshold = ref(globalState.similarityThreshold || 80);
 const newFolders = ref([...globalState.selectedFolders || []]);
-const newRecursive = ref(globalState.recursive !== undefined ? globalState.recursive : true);
+// 默认始终递归扫描子文件夹
+const newRecursive = ref(true);
 const isRescanning = ref(false);
 
 // 算法列表
@@ -46,8 +47,12 @@ const algorithms = [
 ];
 
 // 打开文件夹选择对话框
+// 获取文件夹中的图像列表
 const openFolderDialog = async () => {
     try {
+        // 显示加载状态
+        state.value.processingStatus = "正在打开文件选择器...";
+        
         const selected = await window.__TAURI__.dialog.open({
             directory: true,
             multiple: true,
@@ -62,12 +67,19 @@ const openFolderDialog = async () => {
             
             if (filteredFolders.length > 0) {
                 newFolders.value = [...newFolders.value, ...filteredFolders];
+                state.value.processingStatus = `已添加 ${filteredFolders.length} 个文件夹`;
+            } else {
+                state.value.processingStatus = "未添加新文件夹";
             }
         } else if (selected && !newFolders.value.includes(selected)) {
             newFolders.value.push(selected);
+            state.value.processingStatus = "已添加1个文件夹";
+        } else if (selected === null) {
+            state.value.processingStatus = "已取消选择";
         }
     } catch (err) {
         console.error("选择文件夹时出错：", err);
+        state.value.processingStatus = `选择文件夹时出错: ${err}`;
     }
 };
 
@@ -76,11 +88,11 @@ const rescan = async () => {
     if (newFolders.value.length === 0 || isRescanning.value) {
         return;
     }
-    
+        
     isRescanning.value = true;
     showSettings.value = false;
     state.value.processingStatus = "正在重新扫描...";
-    
+        
     try {
         // 准备请求参数
         const duplicateGroups = await window.__TAURI__.core.invoke("find_duplicates", {
@@ -88,22 +100,35 @@ const rescan = async () => {
                 folder_paths: newFolders.value,
                 algorithm: newAlgorithm.value,
                 similarity_threshold: Number(newThreshold.value),
-                recursive: newRecursive.value,
+                recursive: true, // 始终递归扫描子文件夹
             },
         });
 
         // 更新全局状态
-        globalState.duplicateGroups = duplicateGroups;
+        globalState.duplicateGroups = duplicateGroups || []; // 确保始终是数组，即使返回null或undefined
         globalState.selectedFolders = [...newFolders.value];
         globalState.algorithm = newAlgorithm.value;
         globalState.similarityThreshold = newThreshold.value;
-        globalState.recursive = newRecursive.value;
+        globalState.recursive = true; // 始终递归扫描子文件夹
         
+        // 更新扫描统计信息
+        if (!globalState.scanStats) {
+            globalState.scanStats = {};
+        }
+        
+        // 如果没有找到重复图片，确保统计信息正确
+        if (!duplicateGroups || duplicateGroups.length === 0) {
+            globalState.scanStats.processedImages = 0;
+        }
+            
         // 重新加载数据
         loadData();
     } catch (err) {
         console.error("重新扫描出错：", err);
         state.value.processingStatus = `重新扫描出错: ${err}`;
+        // 清空当前重复组显示
+        state.value.duplicateGroups = [];
+        state.value.selectedImages = {};
     } finally {
         isRescanning.value = false;
     }
@@ -182,8 +207,8 @@ const handleScroll = () => {
     
     // 检测是否滚动到底部 - 使用更严格的判断
     // 如果滚动位置 + 窗口高度接近文档总高度，认为到达底部
-    // 添加30px的缓冲区以提高用户体验
-    isAtBottom.value = scrollHeight - (scrollPosition + windowHeight) < 30;
+    // 添加50px的缓冲区以提高用户体验
+    isAtBottom.value = scrollHeight - (scrollPosition + windowHeight) < 50;
     
     // 更新当前可见分组索引（用于导航菜单高亮）
     updateCurrentVisibleGroup();
@@ -249,9 +274,21 @@ const scrollToBottom = () => {
 // 加载数据
 const loadData = async () => {
     try {
+        // 清空当前状态，确保不会显示旧数据
+        state.value.duplicateGroups = [];
+        state.value.selectedImages = {};
+        
+        // 检查是否有重复组
         if (!globalState.duplicateGroups?.length) {
             state.value.processingStatus =
                 "没有找到重复图片，或所有重复图片已处理完毕";
+            
+            // 确保统计信息正确
+            if (globalState.scanStats) {
+                state.value.scanStats = globalState.scanStats;
+                state.value.scanStats.processedImages = 0;
+            }
+            
             return;
         }
 
@@ -289,10 +326,10 @@ const loadData = async () => {
             (sum, group) => sum + group.images.length,
             0,
         );
-            
-        // 更新处理过的重复图像数
+        
+        // 更新处理的重复图像数
         state.value.scanStats.processedImages = totalDuplicates;
-            
+        
         // 如果globalState中没有totalImages，则计算唯一图像数
         if (!state.value.scanStats.totalImages) {
             // 计算所有唯一图像数量
@@ -307,6 +344,10 @@ const loadData = async () => {
     } catch (err) {
         console.error("加载数据失败:", err);
         state.value.processingStatus = "加载数据失败，请重试";
+        
+        // 出错时清空数据
+        state.value.duplicateGroups = [];
+        state.value.selectedImages = {};
     }
 };
 
@@ -907,15 +948,34 @@ const processGroup = (group) => {
                     <div class="p-4">
                         <!-- 算法选择 -->
                         <div class="mb-4">
-                            <label class="block text-sm font-medium text-slate-700 mb-2">
+                            <label class="block text-sm font-medium text-slate-700 mb-2 flex items-center gap-2">
+                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-slate-500">
+                                    <rect width="18" height="18" x="3" y="3" rx="2" ry="2"></rect>
+                                    <path d="M7 17v-4"></path>
+                                    <path d="M11 17v-8"></path>
+                                    <path d="M15 17v-4"></path>
+                                    <path d="M19 17v-8"></path>
+                                </svg>
                                 检测算法
                             </label>
-                            <select 
-                                v-model="newAlgorithm" 
-                                class="w-full p-2 border border-slate-300 rounded-lg bg-white focus:border-blue-500 focus:ring-2 focus:ring-blue-200 shadow-sm"
-                            >
-                                <option v-for="algo in algorithms" :key="algo.id" :value="algo.id">{{ algo.name }}</option>
-                            </select>
+                            <div class="grid grid-cols-1 sm:grid-cols-3 gap-2 mb-1">
+                                <button
+                                    v-for="algo in algorithms"
+                                    :key="algo.id"
+                                    type="button"
+                                    @click="newAlgorithm = algo.id"
+                                    :class="{
+                                        'px-3 py-2 rounded-lg text-sm transition-all duration-300 border flex items-center justify-center gap-1': true,
+                                        'bg-blue-50 border-blue-200 text-blue-600 shadow-sm': newAlgorithm === algo.id,
+                                        'bg-white border-slate-200 text-slate-700 hover:bg-slate-50': newAlgorithm !== algo.id
+                                    }"
+                                >
+                                    <svg v-if="newAlgorithm === algo.id" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                        <polyline points="20 6 9 17 4 12"></polyline>
+                                    </svg>
+                                    {{ algo.name }}
+                                </button>
+                            </div>
                         </div>
                         
                         <!-- 相似度阈值 -->
@@ -935,55 +995,60 @@ const processGroup = (group) => {
                         
                         <!-- 文件夹选择 -->
                         <div class="mb-4">
-                            <label class="block text-sm font-medium text-slate-700 mb-2">
-                                当前文件夹
+                            <label class="block text-sm font-medium text-slate-700 mb-2 flex items-center gap-2">
+                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-slate-500">
+                                    <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"></path>
+                                </svg>
+                                扫描文件夹
                             </label>
-                            <div class="max-h-32 overflow-y-auto scrollbar-thin mb-2 border border-slate-200 rounded-lg">
-                                <div 
-                                    v-for="(folder, index) in newFolders" 
-                                    :key="index"
-                                    class="flex items-center justify-between bg-white p-2 rounded mb-1 text-sm border-b border-slate-100 last:border-b-0"
-                                >
-                                    <div class="truncate text-slate-600">{{ folder }}</div>
-                                    <button 
-                                        @click="newFolders.splice(index, 1)"
-                                        class="text-red-500 hover:text-red-700"
+                            <div class="overflow-hidden rounded-lg border border-slate-200 shadow-sm mb-2">
+                                <div class="max-h-32 overflow-y-auto scrollbar-thin divide-y divide-slate-100">
+                                    <div v-if="newFolders.length === 0" class="flex items-center justify-center p-3 text-sm text-slate-500 bg-slate-50 italic">
+                                        未选择文件夹
+                                    </div>
+                                    <div 
+                                        v-for="(folder, index) in newFolders" 
+                                        :key="index"
+                                        class="flex items-center justify-between p-2.5 bg-white hover:bg-slate-50 text-sm group transition-colors"
                                     >
-                                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                            <line x1="18" y1="6" x2="6" y2="18"></line>
-                                            <line x1="6" y1="6" x2="18" y2="18"></line>
+                                        <div class="flex items-center gap-2 truncate text-slate-700">
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-amber-500 flex-shrink-0">
+                                                <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"></path>
+                                            </svg>
+                                            <span class="truncate">{{ folder }}</span>
+                                        </div>
+                                        <button 
+                                            @click="newFolders.splice(index, 1)"
+                                            class="p-1 text-slate-400 hover:text-red-500 rounded-full opacity-0 group-hover:opacity-100 transition-opacity"
+                                            title="移除此文件夹"
+                                        >
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                <line x1="18" y1="6" x2="6" y2="18"></line>
+                                                <line x1="6" y1="6" x2="18" y2="18"></line>
+                                            </svg>
+                                        </button>
+                                    </div>
+                                </div>
+                                <div class="bg-slate-50 p-2 border-t border-slate-100">
+                                    <button 
+                                        @click="openFolderDialog"
+                                        class="w-full py-2 bg-white border border-slate-200 text-slate-700 rounded-lg hover:bg-slate-50 hover:border-slate-300 transition-all flex items-center justify-center gap-2 shadow-sm transform hover:-translate-y-0.5 active:translate-y-0 duration-300"
+                                    >
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-blue-500">
+                                            <path d="M5 4h4l3 3h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"></path>
+                                            <line x1="12" y1="11" x2="12" y2="17"></line>
+                                            <line x1="9" y1="14" x2="15" y2="14"></line>
                                         </svg>
+                                        添加文件夹
                                     </button>
                                 </div>
                             </div>
-                            <button 
-                                @click="openFolderDialog"
-                                class="w-full py-2 bg-slate-100 text-slate-700 rounded-lg hover:bg-slate-200 transition-colors flex items-center justify-center gap-2 shadow-sm transform hover:-translate-y-0.5 active:translate-y-0 duration-300"
-                            >
-                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                    <path d="M5 4h4l3 3h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"></path>
-                                    <line x1="12" y1="11" x2="12" y2="17"></line>
-                                    <line x1="9" y1="14" x2="15" y2="14"></line>
-                                </svg>
-                                添加文件夹
-                            </button>
                         </div>
                         
-                        <!-- 递归选项 -->
-                        <div class="mb-6 flex items-center gap-2">
-                            <input 
-                                type="checkbox" 
-                                id="recursive-checkbox" 
-                                v-model="newRecursive"
-                                class="rounded border-slate-300 text-slate-700 focus:ring-slate-500"
-                            />
-                            <label for="recursive-checkbox" class="text-sm text-slate-700">
-                                包含子文件夹
-                            </label>
-                        </div>
+                        <!-- 移除递归选项，默认递归扫描 -->
                         
                         <!-- 操作按钮 -->
-                        <div class="flex justify-between">
+                        <div class="flex justify-between mt-6">
                             <button 
                                 @click="showSettings = false"
                                 class="px-4 py-2 bg-slate-100 text-slate-700 rounded-lg hover:bg-slate-200 transform hover:-translate-y-0.5 active:translate-y-0 transition-all duration-300 shadow-sm"
@@ -992,9 +1057,12 @@ const processGroup = (group) => {
                             </button>
                             <button 
                                 @click="rescan"
-                                class="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transform hover:-translate-y-0.5 active:translate-y-0 transition-all duration-300 shadow-sm disabled:bg-blue-300 disabled:cursor-not-allowed disabled:transform-none"
+                                class="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transform hover:-translate-y-0.5 active:translate-y-0 transition-all duration-300 shadow-sm disabled:bg-blue-300 disabled:cursor-not-allowed disabled:transform-none flex items-center gap-2"
                                 :disabled="newFolders.length === 0 || isRescanning"
                             >
+                                <svg v-if="isRescanning" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="animate-spin">
+                                    <path d="M21 12a9 9 0 1 1-6.219-8.56"></path>
+                                </svg>
                                 <span v-if="isRescanning">扫描中...</span>
                                 <span v-else>重新扫描</span>
                             </button>
