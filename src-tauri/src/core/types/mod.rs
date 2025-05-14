@@ -1,3 +1,5 @@
+pub mod compact_hash;
+
 use serde::{Serialize, Deserialize};
 use std::path::PathBuf;
 
@@ -105,3 +107,6 @@ pub struct DuplicateDetectionRequest {
     /// 是否递归子文件夹
     pub recursive: bool,
 }
+
+// 重新导出 CompactHash 结构
+pub use self::compact_hash::CompactHash;

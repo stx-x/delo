@@ -27,7 +27,7 @@ pub fn calculate_orb_features(path: &Path) -> Result<HashResult, String> {
     let gray_img = image_utils::to_grayscale(&img);
     
     // 检测FAST角点
-    let keypoints = detect_fast_keypoints(&gray_img, 20, 500)?;
+    let keypoints = detect_fast_keypoints(&gray_img, 20, 800)?;
     
     if keypoints.is_empty() {
         return Err(format!("在图像中未检测到特征点: {}", path.display()));
@@ -39,8 +39,8 @@ pub fn calculate_orb_features(path: &Path) -> Result<HashResult, String> {
     // 计算BRIEF描述子
     let descriptors = compute_brief_descriptors(&gray_img, &oriented_keypoints);
     
-    // 将结果序列化为字符串
-    let features_str = serialize_features(&descriptors);
+    // 将结果序列化为字符串，使用优化的二进制编码
+    let features_str = serialize_features_optimized(&descriptors);
     
     Ok(HashResult {
         hash: features_str,
@@ -293,6 +293,9 @@ fn compute_brief_descriptors(img: &GrayImage, keypoints: &[OrientedKeyPoint]) ->
     let max_width = width as i32 - 1;
     let max_height = height as i32 - 1;
     
+    // 创建一个高斯模糊的图像版本以提高特征稳定性
+    let blurred_img = image::imageops::blur(img, 1.2);
+    
     for kp in keypoints {
         let mut descriptor = Descriptor {
             x: kp.x,
@@ -304,8 +307,6 @@ fn compute_brief_descriptors(img: &GrayImage, keypoints: &[OrientedKeyPoint]) ->
         // 预计算三角函数值
         let cos_theta = kp.angle.cos();
         let sin_theta = kp.angle.sin();
-        
-        // 高斯模糊可以提高特征的稳定性，但为了性能这里省略
         
         // 计算旋转不变的描述子
         for i in 0..BRIEF_PATTERN_SIZE {
@@ -326,9 +327,9 @@ fn compute_brief_descriptors(img: &GrayImage, keypoints: &[OrientedKeyPoint]) ->
             // 边界检查
             if x1 >= 0 && x1 <= max_width && y1 >= 0 && y1 <= max_height &&
                x2 >= 0 && x2 <= max_width && y2 >= 0 && y2 <= max_height {
-                // 比较两个点的像素值
-                let val1 = img.get_pixel(x1 as u32, y1 as u32)[0];
-                let val2 = img.get_pixel(x2 as u32, y2 as u32)[0];
+                // 使用高斯模糊后的图像进行比较，提高稳定性
+                let val1 = blurred_img.get_pixel(x1 as u32, y1 as u32)[0];
+                let val2 = blurred_img.get_pixel(x2 as u32, y2 as u32)[0];
                 
                 // 设置描述子位
                 if val1 < val2 {
@@ -382,7 +383,7 @@ fn serialize_features(descriptors: &[Descriptor]) -> String {
     let mut data = Vec::new();
     
     // 存储描述子数量
-    let count = descriptors.len().min(50); // 最多保存50个特征点
+    let count = descriptors.len().min(500); // 最多保存500个特征点
     data.extend_from_slice(&(count as u32).to_le_bytes());
     
     // 存储每个描述子
@@ -402,8 +403,78 @@ fn serialize_features(descriptors: &[Descriptor]) -> String {
     general_purpose::STANDARD.encode(&data)
 }
 
+/// 优化的特征点序列化（使用压缩和更紧凑的编码）
+fn serialize_features_optimized(descriptors: &[Descriptor]) -> String {
+    use std::io::Write;
+    
+    // 使用更高效的压缩
+    let mut compressed_data = Vec::with_capacity(descriptors.len() * 40); // 预估大小
+    let mut encoder = flate2::write::ZlibEncoder::new(
+        &mut compressed_data, 
+        flate2::Compression::best()
+    );
+    
+    // 保存要使用的特征点数量（最多500个，并优先选择得分高的）
+    let mut sorted_descriptors = descriptors.to_vec();
+    sorted_descriptors.sort_by(|a, b| {
+        // 根据特征点的x,y计算一个简单的分数 (中心点附近的特征点更重要)
+        let score_a = ((a.x as f32).powi(2) + (a.y as f32).powi(2)).sqrt();
+        let score_b = ((b.x as f32).powi(2) + (b.y as f32).powi(2)).sqrt();
+        score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    
+    let count = sorted_descriptors.len().min(500);
+    encoder.write_all(&(count as u32).to_le_bytes()).unwrap();
+    
+    // 为所有描述子定义一个全局的特征矢量
+    let mut global_descriptor = [0u8; 32];
+    
+    // 存储每个描述子
+    for i in 0..count {
+        let desc = &sorted_descriptors[i];
+        
+        // 累加到全局特征
+        for j in 0..32 {
+            global_descriptor[j] |= desc.data[j];
+        }
+        
+        // 存储位置和角度 (更紧凑的表示)
+        // 使用16位存储坐标而不是32位
+        let x_u16 = (desc.x & 0xFFFF) as u16;
+        let y_u16 = (desc.y & 0xFFFF) as u16;
+        
+        encoder.write_all(&x_u16.to_le_bytes()).unwrap();
+        encoder.write_all(&y_u16.to_le_bytes()).unwrap();
+        
+        // 将角度量化为8位
+        let angle_u8 = ((desc.angle / (2.0 * std::f32::consts::PI)) * 255.0) as u8;
+        encoder.write_all(&[angle_u8]).unwrap();
+        
+        // 存储描述子数据
+        encoder.write_all(&desc.data).unwrap();
+    }
+    
+    // 添加全局描述符到开头
+    encoder.write_all(&global_descriptor).unwrap();
+    
+    // 完成压缩
+    let compressed_data = encoder.finish().unwrap();
+    
+    // 使用Base64编码
+    general_purpose::STANDARD.encode(&compressed_data)
+}
+
 /// 计算两个ORB特征集合的相似度
 pub fn calculate_orb_similarity(features1: &str, features2: &str) -> Result<f32, String> {
+    // 检查输入是否为优化的压缩特征
+    let is_optimized1 = features1.len() > 20 && features1.starts_with("eJ");
+    let is_optimized2 = features2.len() > 20 && features2.starts_with("eJ");
+    
+    // 如果两者都是优化格式，使用优化的比较方法
+    if is_optimized1 && is_optimized2 {
+        return calculate_optimized_similarity(features1, features2);
+    }
+    
     // 解码Base64字符串
     let data1 = general_purpose::STANDARD.decode(features1)
         .map_err(|e| format!("无法解码特征1: {}", e))?;
@@ -411,24 +482,174 @@ pub fn calculate_orb_similarity(features1: &str, features2: &str) -> Result<f32,
     let data2 = general_purpose::STANDARD.decode(features2)
         .map_err(|e| format!("无法解码特征2: {}", e))?;
     
-    // 解析特征点
-    let descriptors1 = deserialize_features(&data1)?;
-    let descriptors2 = deserialize_features(&data2)?;
+    // 尝试解析特征点
+    let descriptors1 = match deserialize_features(&data1) {
+        Ok(desc) => desc,
+        Err(_) => {
+            // 尝试作为优化格式解析
+            if let Ok(desc) = deserialize_optimized_features(&data1) {
+                desc
+            } else {
+                return Err("无法解析特征1".to_string());
+            }
+        }
+    };
+    
+    let descriptors2 = match deserialize_features(&data2) {
+        Ok(desc) => desc,
+        Err(_) => {
+            // 尝试作为优化格式解析
+            if let Ok(desc) = deserialize_optimized_features(&data2) {
+                desc
+            } else {
+                return Err("无法解析特征2".to_string());
+            }
+        }
+    };
     
     // 使用暴力匹配查找最佳匹配
     let matches = match_descriptors(&descriptors1, &descriptors2);
     
     // 计算匹配分数
     let match_count = matches.len();
-    let total = descriptors1.len().min(descriptors2.len());
     
-    if total == 0 {
+    // 根据特征点数量调整分数计算
+    let min_desc_count = descriptors1.len().min(descriptors2.len());
+    let max_desc_count = descriptors1.len().max(descriptors2.len());
+    
+    if min_desc_count == 0 {
         return Ok(0.0);
     }
     
-    // 返回匹配率作为相似度
-    let similarity = (match_count as f32 / total as f32) * 100.0;
-    Ok(similarity)
+    // 返回加权匹配率作为相似度
+    // 当两者特征点数量相近时，结果更可靠
+    let size_ratio_factor = (min_desc_count as f32 / max_desc_count as f32).max(0.5);
+    let similarity = (match_count as f32 / min_desc_count as f32) * 100.0 * size_ratio_factor;
+    
+    Ok(similarity.min(100.0))  // 确保结果不超过100
+}
+
+/// 优化版本的特征相似度计算，直接使用压缩二进制特征
+fn calculate_optimized_similarity(features1: &str, features2: &str) -> Result<f32, String> {
+    use std::io::Read;
+    
+    // 解码Base64字符串
+    let data1 = general_purpose::STANDARD.decode(features1)
+        .map_err(|e| format!("无法解码优化特征1: {}", e))?;
+    
+    let data2 = general_purpose::STANDARD.decode(features2)
+        .map_err(|e| format!("无法解码优化特征2: {}", e))?;
+    
+    // 解压缩数据
+    let mut reader1 = flate2::read::ZlibDecoder::new(&data1[..]);
+    let mut reader2 = flate2::read::ZlibDecoder::new(&data2[..]);
+    
+    // 读取特征点数量
+    let mut count_buf1 = [0u8; 4];
+    let mut count_buf2 = [0u8; 4];
+    
+    if reader1.read_exact(&mut count_buf1).is_err() || 
+       reader2.read_exact(&mut count_buf2).is_err() {
+        return Err("读取特征点数量失败".to_string());
+    }
+    
+    let desc_count1 = u32::from_le_bytes(count_buf1) as usize;
+    let desc_count2 = u32::from_le_bytes(count_buf2) as usize;
+    
+    // 跳过所有特征点数据，直接读取全局描述符
+    let descriptor_size = 2 + 2 + 1 + 32; // x(u16), y(u16), angle(u8), data[32]
+    let mut reader1_skip = vec![0u8; desc_count1 * descriptor_size];
+    let mut reader2_skip = vec![0u8; desc_count2 * descriptor_size];
+    
+    if reader1.read_exact(&mut reader1_skip).is_err() || 
+       reader2.read_exact(&mut reader2_skip).is_err() {
+        return Err("读取特征点数据失败".to_string());
+    }
+    
+    // 读取全局描述符
+    let mut global_desc1 = [0u8; 32];
+    let mut global_desc2 = [0u8; 32];
+    
+    if reader1.read_exact(&mut global_desc1).is_err() || 
+       reader2.read_exact(&mut global_desc2).is_err() {
+        return Err("读取全局描述符失败".to_string());
+    }
+    
+    // 计算全局描述符的汉明距离
+    let hamming_distance = compute_hamming_distance(&global_desc1, &global_desc2);
+    
+    // 将汉明距离转换为相似度 (最大距离是256位)
+    let max_distance = 256.0;
+    let global_similarity = (1.0 - (hamming_distance as f32 / max_distance)) * 100.0;
+    
+    // 基于特征点数量调整分数
+    let min_count = desc_count1.min(desc_count2) as f32;
+    let max_count = desc_count1.max(desc_count2) as f32;
+    let count_ratio = (min_count / max_count).max(0.5);
+    
+    // 最终相似度是全局描述符相似度乘以特征点数量比率
+    let similarity = global_similarity * count_ratio;
+    
+    Ok(similarity.min(100.0))  // 确保结果不超过100
+}
+
+/// 尝试解析优化的压缩特征
+fn deserialize_optimized_features(data: &[u8]) -> Result<Vec<Descriptor>, String> {
+    use std::io::Read;
+    
+    // 创建解压缩读取器
+    let mut reader = flate2::read::ZlibDecoder::new(data);
+    
+    // 读取描述子数量
+    let mut count_bytes = [0u8; 4];
+    if reader.read_exact(&mut count_bytes).is_err() {
+        return Err("无法读取特征点数量".to_string());
+    }
+    
+    let count = u32::from_le_bytes(count_bytes) as usize;
+    if count > 1000 {
+        return Err("特征点数量异常".to_string());
+    }
+    
+    let mut descriptors = Vec::with_capacity(count);
+    
+    // 读取每个描述子
+    for _ in 0..count {
+        // 读取位置
+        let mut x_bytes = [0u8; 2];
+        let mut y_bytes = [0u8; 2];
+        
+        if reader.read_exact(&mut x_bytes).is_err() || 
+           reader.read_exact(&mut y_bytes).is_err() {
+            return Err("读取位置失败".to_string());
+        }
+        
+        let x = u16::from_le_bytes(x_bytes) as u32;
+        let y = u16::from_le_bytes(y_bytes) as u32;
+        
+        // 读取角度
+        let mut angle_byte = [0u8; 1];
+        if reader.read_exact(&mut angle_byte).is_err() {
+            return Err("读取角度失败".to_string());
+        }
+        
+        let angle = (angle_byte[0] as f32 / 255.0) * 2.0 * std::f32::consts::PI;
+        
+        // 读取描述子数据
+        let mut desc_data = [0u8; 32];
+        if reader.read_exact(&mut desc_data).is_err() {
+            return Err("读取描述子数据失败".to_string());
+        }
+        
+        descriptors.push(Descriptor {
+            x,
+            y,
+            angle,
+            data: desc_data,
+        });
+    }
+    
+    Ok(descriptors)
 }
 
 /// 反序列化特征
@@ -514,8 +735,9 @@ fn match_descriptors(descriptors1: &[Descriptor], descriptors2: &[Descriptor]) -
             }
         }
         
-        // 应用Lowe's比率测试，过滤掉不明确的匹配
-        if best_distance < max_distance && (second_best == u32::MAX || 
+        // Lowe's比率测试，过滤掉不明确的匹配
+        // 增加距离阈值到100，以容忍更大的特征变化
+        if best_distance < 100 && (second_best == u32::MAX || 
                                 (best_distance as f32 / second_best as f32) < ratio_threshold) {
             matches.push((i, best_idx));
         }
@@ -593,7 +815,19 @@ fn filter_matches_by_distance_consistency(
 /// 计算两个描述子的汉明距离
 fn compute_hamming_distance(a: &[u8; 32], b: &[u8; 32]) -> u32 {
     // 使用SIMD指令优化的汉明距离计算
-    a.iter().zip(b.iter())
-        .map(|(&x, &y)| (x ^ y).count_ones())
-        .sum()
+    #[cfg(target_feature = "popcnt")]
+    {
+        // 如果支持POPCNT指令，使用更高效的实现
+        let mut distance = 0;
+        for i in 0..32 {
+            distance += (a[i] ^ b[i]).count_ones();
+        }
+        distance
+    }
+    #[cfg(not(target_feature = "popcnt"))]
+    {
+        a.iter().zip(b.iter())
+            .map(|(&x, &y)| (x ^ y).count_ones())
+            .sum()
+    }
 }

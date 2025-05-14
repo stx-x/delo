@@ -50,16 +50,32 @@ pub fn get_supported_algorithms() -> Vec<String> {
 /// 计算重复检测的统计信息
 #[tauri::command(rename_all = "snake_case")]
 pub fn get_detection_stats(req: DuplicateDetectionRequest) -> Result<DetectionStats, String> {
+    let start_time = std::time::Instant::now();
     let folder_paths: Vec<PathBuf> = req.folder_paths.iter().map(|p| PathBuf::from(p)).collect();
+
+    // 统计文件总数
+    let mut total_files = 0;
+    for folder in &folder_paths {
+        if let Ok(stats) = get_folder_stats(folder.to_string_lossy().to_string(), req.recursive) {
+            total_files += stats.total_files;
+        }
+    }
 
     // 获取所有图像路径
     let all_paths = get_all_image_paths(&folder_paths, req.recursive)?;
+    
+    // 计算处理时间
+    let elapsed = start_time.elapsed();
+    let processing_time_ms = elapsed.as_millis() as u64;
 
     Ok(DetectionStats {
         image_count: all_paths.len(),
         folder_count: folder_paths.len(),
         algorithm: req.algorithm.name().to_string(),
         similarity_threshold: req.similarity_threshold,
+        total_files,
+        duplicate_count: 0, // 此时还未检测重复，设为0
+        processing_time_ms,
     })
 }
 
@@ -74,6 +90,12 @@ pub struct DetectionStats {
     pub algorithm: String,
     /// 相似度阈值
     pub similarity_threshold: u32,
+    /// 总文件数
+    pub total_files: usize,
+    /// 重复图像数
+    pub duplicate_count: usize,
+    /// 处理时间(毫秒)
+    pub processing_time_ms: u64,
 }
 
 /// 文件夹统计信息
