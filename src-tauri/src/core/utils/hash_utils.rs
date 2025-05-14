@@ -58,9 +58,8 @@ pub fn calculate_similarity(hash1: &str, hash2: &str, algorithm: HashAlgorithm) 
 
 /// 计算ORB特征匹配的相似度
 fn compute_orb_similarity(features1: &str, features2: &str) -> Result<f32, String> {
-    // 这里会调用算法特定的相似度计算，暂时只返回示例值
-    // 实际实现会在ORB算法模块中
-    Ok(50.0)
+    // 调用ORB算法模块中的相似度计算函数
+    crate::algorithms::orb::calculate_orb_similarity(features1, features2)
 }
 
 /// 将哈希字符串分割成多个片段(用于LSH算法)

@@ -811,6 +811,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.21.7",
  "env_logger",
+ "fastrand",
  "image",
  "rand 0.8.5",
  "rayon",

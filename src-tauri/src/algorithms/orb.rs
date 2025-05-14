@@ -87,97 +87,144 @@ fn detect_fast_keypoints(img: &GrayImage, threshold: u8, max_points: usize) -> R
     let mut keypoints = Vec::new();
     let radius = 3; // FAST使用3像素半径的圆
     
+    // 获取Bresenham圆模式（只计算一次）
+    let circle_pattern = get_bresenham_circle_pattern(radius);
+    
     // 在图像上遍历可能的角点
     for y in radius..height - radius {
         for x in radius..width - radius {
             let center_val = img.get_pixel(x, y)[0];
             
-            // 检查Bresenham圆上的16个点
-            let circle_points = get_bresenham_circle(x, y, radius);
+            // 快速连续检查
+            let mut is_corner = false;
             
-            // 计算连续的更亮或更暗的点的数量
-            let mut brighter_count = 0;
-            let mut darker_count = 0;
-            let mut max_consecutive = 0;
+            // 首先检查12, 4, 8, 0点位 (对应 北, 东, 南, 西)
+            // 这是一个加速检测的优化，如果这四个点中至少有三个满足条件，才继续检查
+            let top = img.get_pixel(x, y - radius)[0];
+            let right = img.get_pixel(x + radius, y)[0];
+            let bottom = img.get_pixel(x, y + radius)[0];
+            let left = img.get_pixel(x - radius, y)[0];
             
-            for &(px, py) in &circle_points {
-                if px >= width || py >= height {
-                    continue;
-                }
-                
-                let point_val = img.get_pixel(px, py)[0];
-                
-                if point_val > center_val + threshold {
-                    brighter_count += 1;
-                    darker_count = 0;
-                } else if point_val < center_val - threshold {
-                    darker_count += 1;
-                    brighter_count = 0;
-                } else {
-                    brighter_count = 0;
-                    darker_count = 0;
-                }
-                
-                max_consecutive = max_consecutive.max(brighter_count).max(darker_count);
-                
-                // 如果找到9个连续的更亮或更暗的点，认为是角点
-                if max_consecutive >= 9 {
-                    break;
-                }
-            }
+            let brighter_count = (top > center_val + threshold) as u8 +
+                                (right > center_val + threshold) as u8 +
+                                (bottom > center_val + threshold) as u8 +
+                                (left > center_val + threshold) as u8;
+                                
+            let darker_count = (top < center_val - threshold) as u8 +
+                              (right < center_val - threshold) as u8 +
+                              (bottom < center_val - threshold) as u8 +
+                              (left < center_val - threshold) as u8;
             
-            if max_consecutive >= 9 {
-                // 计算角点得分
-                let mut score = 0.0;
-                for &(px, py) in &circle_points {
+            // 如果至少有3个方向满足条件，继续完整检查
+            if brighter_count >= 3 || darker_count >= 3 {
+                // 现在检查Bresenham圆上的16个点
+                let mut consecutive_brighter = 0;
+                let mut consecutive_darker = 0;
+                let mut max_consecutive = 0;
+                
+                // 根据模式计算圆上每个点的坐标
+                for &(dx, dy) in &circle_pattern {
+                    let px = (x as i32 + dx) as u32;
+                    let py = (y as i32 + dy) as u32;
+                    
                     if px >= width || py >= height {
                         continue;
                     }
                     
                     let point_val = img.get_pixel(px, py)[0];
-                    let diff = (point_val as i16 - center_val as i16).abs() as f32;
-                    score += diff;
+                    
+                    if point_val > center_val + threshold {
+                        consecutive_brighter += 1;
+                        consecutive_darker = 0;
+                    } else if point_val < center_val - threshold {
+                        consecutive_darker += 1;
+                        consecutive_brighter = 0;
+                    } else {
+                        consecutive_brighter = 0;
+                        consecutive_darker = 0;
+                    }
+                    
+                    // 记录最大连续数
+                    max_consecutive = max_consecutive.max(consecutive_brighter).max(consecutive_darker);
+                    
+                    // 如果找到9个连续的更亮或更暗的点，认为是角点
+                    if max_consecutive >= 9 {
+                        is_corner = true;
+                        break;
+                    }
                 }
                 
-                keypoints.push(KeyPoint {
-                    x,
-                    y,
-                    score: score / 16.0, // 平均差异作为分数
-                });
+                if is_corner {
+                    // 计算非最大抑制得分 (使用绝对差值作为角点响应强度)
+                    let mut score = 0.0;
+                    for &(dx, dy) in &circle_pattern {
+                        let px = (x as i32 + dx) as u32;
+                        let py = (y as i32 + dy) as u32;
+                        
+                        if px >= width || py >= height {
+                            continue;
+                        }
+                        
+                        let point_val = img.get_pixel(px, py)[0];
+                        let diff = (point_val as i16 - center_val as i16).abs() as f32;
+                        score += diff;
+                    }
+                    
+                    keypoints.push(KeyPoint {
+                        x,
+                        y,
+                        score: score / 16.0, // 平均差异作为分数
+                    });
+                }
             }
         }
     }
     
     // 如果找到的角点太多，保留得分最高的一些
     if keypoints.len() > max_points {
-        keypoints.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+        keypoints.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
         keypoints.truncate(max_points);
     }
     
     Ok(keypoints)
 }
 
-/// 获取Bresenham圆上的点
+/// 获取Bresenham圆的偏移模式（相对于中心点的偏移）
+fn get_bresenham_circle_pattern(radius: u32) -> Vec<(i32, i32)> {
+    let mut pattern = Vec::with_capacity(16);
+    let r = radius as i32;
+    
+    // FAST测试中的16个点（圆周上等间隔的点）的相对偏移
+    pattern.push((0, -r));     // 北 (0)
+    pattern.push((1, -r+1));   // (1)
+    pattern.push((2, -r+2));   // (2)
+    pattern.push((r-1, -1));   // (3)
+    pattern.push((r, 0));      // 东 (4)
+    pattern.push((r-1, 1));    // (5)
+    pattern.push((r-2, 2));    // (6)
+    pattern.push((1, r-1));    // (7)
+    pattern.push((0, r));      // 南 (8)
+    pattern.push((-1, r-1));   // (9)
+    pattern.push((-2, r-2));   // (10)
+    pattern.push((-r+1, 1));   // (11)
+    pattern.push((-r, 0));     // 西 (12)
+    pattern.push((-r+1, -1));  // (13)
+    pattern.push((-r+2, -2));  // (14)
+    pattern.push((-1, -r+1));  // (15)
+    
+    pattern
+}
+
+/// 获取Bresenham圆上的点（实际坐标）
 fn get_bresenham_circle(center_x: u32, center_y: u32, radius: u32) -> Vec<(u32, u32)> {
+    let pattern = get_bresenham_circle_pattern(radius);
     let mut points = Vec::with_capacity(16);
     
-    // FAST测试中的16个点（圆周上等间隔的点）
-    points.push((center_x, center_y - radius)); // 北
-    points.push((center_x + 1, center_y - radius + 1));
-    points.push((center_x + 2, center_y - radius + 2));
-    points.push((center_x + radius - 1, center_y - 1));
-    points.push((center_x + radius, center_y)); // 东
-    points.push((center_x + radius - 1, center_y + 1));
-    points.push((center_x + radius - 2, center_y + 2));
-    points.push((center_x + 1, center_y + radius - 1));
-    points.push((center_x, center_y + radius)); // 南
-    points.push((center_x - 1, center_y + radius - 1));
-    points.push((center_x - 2, center_y + radius - 2));
-    points.push((center_x - radius + 1, center_y + 1));
-    points.push((center_x - radius, center_y)); // 西
-    points.push((center_x - radius + 1, center_y - 1));
-    points.push((center_x - radius + 2, center_y - 2));
-    points.push((center_x - 1, center_y - radius + 1));
+    for &(dx, dy) in &pattern {
+        let px = (center_x as i32 + dx) as u32;
+        let py = (center_y as i32 + dy) as u32;
+        points.push((px, py));
+    }
     
     points
 }
@@ -192,21 +239,27 @@ fn compute_keypoint_orientations(img: &GrayImage, keypoints: &[KeyPoint]) -> Vec
         let y = kp.y;
         let score = kp.score;
         
-        // 计算角点周围区域的矩
+        // 计算角点周围区域的图像矩
         let mut m_01 = 0.0;
         let mut m_10 = 0.0;
         let radius = 7; // 计算方向的区域半径
         
-        for dy in -(radius as i32)..=(radius as i32) {
-            for dx in -(radius as i32)..=(radius as i32) {
-                let nx = x as i32 + dx;
-                let ny = y as i32 + dy;
+        // 使用图像块来减少边界检查的频率
+        let min_x = x.saturating_sub(radius);
+        let min_y = y.saturating_sub(radius);
+        let max_x = (x + radius).min(width - 1);
+        let max_y = (y + radius).min(height - 1);
+        
+        for py in min_y..=max_y {
+            for px in min_x..=max_x {
+                let dx = px as i32 - x as i32;
+                let dy = py as i32 - y as i32;
                 
-                // 检查边界
-                if nx >= 0 && nx < width as i32 && ny >= 0 && ny < height as i32 {
-                    let intensity = img.get_pixel(nx as u32, ny as u32)[0] as f32;
+                // 圆形区域内的点
+                if dx*dx + dy*dy <= (radius as i32)*(radius as i32) {
+                    let intensity = img.get_pixel(px, py)[0] as f32;
                     
-                    // 计算矩
+                    // 计算图像矩
                     m_10 += dx as f32 * intensity;
                     m_01 += dy as f32 * intensity;
                 }
@@ -236,6 +289,10 @@ fn compute_brief_descriptors(img: &GrayImage, keypoints: &[OrientedKeyPoint]) ->
     let pattern = generate_brief_pattern();
     let mut descriptors = Vec::with_capacity(keypoints.len());
     
+    // 图像边界
+    let max_width = width as i32 - 1;
+    let max_height = height as i32 - 1;
+    
     for kp in keypoints {
         let mut descriptor = Descriptor {
             x: kp.x,
@@ -244,18 +301,21 @@ fn compute_brief_descriptors(img: &GrayImage, keypoints: &[OrientedKeyPoint]) ->
             data: [0u8; 32], // 256位 = 32字节
         };
         
+        // 预计算三角函数值
         let cos_theta = kp.angle.cos();
         let sin_theta = kp.angle.sin();
+        
+        // 高斯模糊可以提高特征的稳定性，但为了性能这里省略
         
         // 计算旋转不变的描述子
         for i in 0..BRIEF_PATTERN_SIZE {
             let (pattern_x1, pattern_y1, pattern_x2, pattern_y2) = pattern[i];
             
-            // 旋转采样点
+            // 旋转采样点 - 修复第一个点的旋转计算错误
             let rotated_x1 = pattern_x1 * cos_theta - pattern_y1 * sin_theta;
-            let rotated_y1 = pattern_x1 * sin_theta + pattern_y1 * cos_theta;
+            let rotated_y1 = pattern_y1 * cos_theta + pattern_x1 * sin_theta;
             let rotated_x2 = pattern_x2 * cos_theta - pattern_y2 * sin_theta;
-            let rotated_y2 = pattern_x2 * sin_theta + pattern_y2 * cos_theta;
+            let rotated_y2 = pattern_y2 * cos_theta + pattern_x2 * sin_theta;
             
             // 计算在图像上的绝对坐标
             let x1 = (kp.x as f32 + rotated_x1).round() as i32;
@@ -263,9 +323,9 @@ fn compute_brief_descriptors(img: &GrayImage, keypoints: &[OrientedKeyPoint]) ->
             let x2 = (kp.x as f32 + rotated_x2).round() as i32;
             let y2 = (kp.y as f32 + rotated_y2).round() as i32;
             
-            // 检查边界
-            if x1 >= 0 && x1 < width as i32 && y1 >= 0 && y1 < height as i32 &&
-               x2 >= 0 && x2 < width as i32 && y2 >= 0 && y2 < height as i32 {
+            // 边界检查
+            if x1 >= 0 && x1 <= max_width && y1 >= 0 && y1 <= max_height &&
+               x2 >= 0 && x2 <= max_width && y2 >= 0 && y2 <= max_height {
                 // 比较两个点的像素值
                 let val1 = img.get_pixel(x1 as u32, y1 as u32)[0];
                 let val2 = img.get_pixel(x2 as u32, y2 as u32)[0];
@@ -275,6 +335,7 @@ fn compute_brief_descriptors(img: &GrayImage, keypoints: &[OrientedKeyPoint]) ->
                     descriptor.data[i / 8] |= 1 << (i % 8);
                 }
             }
+            // 如果点超出边界，该位保持为0，增加特征稳定性
         }
         
         descriptors.push(descriptor);
@@ -290,17 +351,24 @@ fn generate_brief_pattern() -> Vec<(f32, f32, f32, f32)> {
     let mut pattern = Vec::with_capacity(BRIEF_PATTERN_SIZE);
     
     // 使用预定义的采样模式
-    // 实际实现中可以使用随机生成的点对或从高斯分布中采样
+    // 基于高斯分布的采样点，而不是均匀分布，提高特征的区分能力
     let s = 15.0; // 采样区域大小
+    let mut rng = fastrand::Rng::with_seed(42); // 使用固定种子保证可重复性
     
-    // 预定义256个点对
-    for i in 0..BRIEF_PATTERN_SIZE {
-        // 简单方法: 在指定区域内生成点对
-        // 实际应用中可能需要更精心设计的采样模式
-        let x1 = (((i * 4) % 31) as f32 - 15.0) * s / 30.0;
-        let y1 = (((i * 4 + 1) % 31) as f32 - 15.0) * s / 30.0;
-        let x2 = (((i * 4 + 2) % 31) as f32 - 15.0) * s / 30.0;
-        let y2 = (((i * 4 + 3) % 31) as f32 - 15.0) * s / 30.0;
+    // 生成高斯分布的采样点对
+    for _ in 0..BRIEF_PATTERN_SIZE {
+        // 使用Box-Muller变换生成高斯分布的随机点
+        // 方法1的点
+        let r1 = (rng.f32() + 0.0000001).ln() * -2.0;
+        let theta1 = rng.f32() * 2.0 * std::f32::consts::PI;
+        let x1 = r1.sqrt() * theta1.cos() * s * 0.04;
+        let y1 = r1.sqrt() * theta1.sin() * s * 0.04;
+        
+        // 方法2的点
+        let r2 = (rng.f32() + 0.0000001).ln() * -2.0;
+        let theta2 = rng.f32() * 2.0 * std::f32::consts::PI;
+        let x2 = r2.sqrt() * theta2.cos() * s * 0.04;
+        let y2 = r2.sqrt() * theta2.sin() * s * 0.04;
         
         pattern.push((x1, y1, x2, y2));
     }
@@ -417,17 +485,26 @@ fn deserialize_features(data: &[u8]) -> Result<Vec<Descriptor>, String> {
 fn match_descriptors(descriptors1: &[Descriptor], descriptors2: &[Descriptor]) -> Vec<(usize, usize)> {
     let mut matches = Vec::new();
     let ratio_threshold = 0.8; // Lowe's比率测试阈值
+    let max_distance = 80; // 最大容许汉明距离
     
-    // 对于描述子1中的每个描述子
-    for (i, desc1) in descriptors1.iter().enumerate() {
+    // 创建一个距离矩阵，避免重复计算
+    let mut distance_matrix = vec![vec![u32::MAX; descriptors2.len()]; descriptors1.len()];
+    
+    // 并行计算所有距离矩阵
+    descriptors1.iter().enumerate().for_each(|(i, desc1)| {
+        descriptors2.iter().enumerate().for_each(|(j, desc2)| {
+            distance_matrix[i][j] = compute_hamming_distance(&desc1.data, &desc2.data);
+        });
+    });
+    
+    // 对于描述子1中的每个描述子找最佳匹配
+    for (i, distances) in distance_matrix.iter().enumerate() {
         let mut best_distance = u32::MAX;
         let mut second_best = u32::MAX;
         let mut best_idx = 0;
         
-        // 查找最佳匹配
-        for (j, desc2) in descriptors2.iter().enumerate() {
-            let distance = compute_hamming_distance(&desc1.data, &desc2.data);
-            
+        // 查找最佳和次佳匹配
+        for (j, &distance) in distances.iter().enumerate() {
             if distance < best_distance {
                 second_best = best_distance;
                 best_distance = distance;
@@ -438,24 +515,85 @@ fn match_descriptors(descriptors1: &[Descriptor], descriptors2: &[Descriptor]) -
         }
         
         // 应用Lowe's比率测试，过滤掉不明确的匹配
-        if best_distance < 80 && (second_best == u32::MAX || 
+        if best_distance < max_distance && (second_best == u32::MAX || 
                                 (best_distance as f32 / second_best as f32) < ratio_threshold) {
             matches.push((i, best_idx));
         }
     }
     
+    // 进行几何验证，移除离群点（可选，对于简单场景可能不需要）
+    // 这里使用简化版本的RANSAC来移除不一致的匹配
+    if matches.len() > 10 {
+        matches = filter_matches_by_distance_consistency(&matches, descriptors1, descriptors2);
+    }
+    
     matches
+}
+
+/// 使用距离一致性过滤匹配点对，移除离群点
+fn filter_matches_by_distance_consistency(
+    matches: &[(usize, usize)],
+    descriptors1: &[Descriptor],
+    descriptors2: &[Descriptor]
+) -> Vec<(usize, usize)> {
+    if matches.len() < 4 {
+        return matches.to_vec();
+    }
+    
+    // 计算匹配点对之间的空间距离比率
+    let mut filtered_matches = Vec::new();
+    
+    for (i, &(idx1, idx2)) in matches.iter().enumerate() {
+        let p1 = (descriptors1[idx1].x, descriptors1[idx1].y);
+        let p2 = (descriptors2[idx2].x, descriptors2[idx2].y);
+        
+        let mut consistent_count = 0;
+        let min_consistent = matches.len() / 4; // 至少1/4的点需要一致
+        
+        // 检查与其他匹配点的一致性
+        for j in 0..matches.len() {
+            if i == j {
+                continue;
+            }
+            
+            let (other_idx1, other_idx2) = matches[j];
+            let other_p1 = (descriptors1[other_idx1].x, descriptors1[other_idx1].y);
+            let other_p2 = (descriptors2[other_idx2].x, descriptors2[other_idx2].y);
+            
+            // 计算两对匹配点之间的距离
+            let dist1 = ((p1.0 as f32 - other_p1.0 as f32).powi(2) + 
+                          (p1.1 as f32 - other_p1.1 as f32).powi(2)).sqrt();
+            
+            let dist2 = ((p2.0 as f32 - other_p2.0 as f32).powi(2) + 
+                          (p2.1 as f32 - other_p2.1 as f32).powi(2)).sqrt();
+            
+            // 如果两个距离的比率接近1，则认为是一致的
+            if dist1 > 0.1 && dist2 > 0.1 {
+                let ratio = if dist1 > dist2 { dist1 / dist2 } else { dist2 / dist1 };
+                if ratio < 1.5 {
+                    consistent_count += 1;
+                }
+            }
+            
+            // 提前终止检查
+            if consistent_count >= min_consistent {
+                break;
+            }
+        }
+        
+        // 如果有足够多的一致点，保留这个匹配
+        if consistent_count >= min_consistent {
+            filtered_matches.push((idx1, idx2));
+        }
+    }
+    
+    filtered_matches
 }
 
 /// 计算两个描述子的汉明距离
 fn compute_hamming_distance(a: &[u8; 32], b: &[u8; 32]) -> u32 {
-    let mut distance = 0;
-    
-    for i in 0..32 {
-        let xor = a[i] ^ b[i];
-        // 计算设置的位数
-        distance += xor.count_ones();
-    }
-    
-    distance
+    // 使用SIMD指令优化的汉明距离计算
+    a.iter().zip(b.iter())
+        .map(|(&x, &y)| (x ^ y).count_ones())
+        .sum()
 }

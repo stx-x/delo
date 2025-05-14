@@ -13,7 +13,13 @@ const globalState = {
   selectedFolders: [],
   algorithm: '',
   similarityThreshold: 0,
-  recursive: true
+  recursive: true,
+  scanStats: {
+    totalFolders: 0,
+    totalFiles: 0,
+    totalImages: 0,
+    processedImages: 0
+  }
 };
 
 // 创建路由

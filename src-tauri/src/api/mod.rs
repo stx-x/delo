@@ -4,6 +4,7 @@ use crate::detection::duplicate::{
 };
 use std::path::{Path, PathBuf};
 use tauri::command;
+use walkdir::WalkDir;
 
 /// 获取文件夹中的图像文件路径
 #[tauri::command(rename_all = "snake_case")]
@@ -73,4 +74,73 @@ pub struct DetectionStats {
     pub algorithm: String,
     /// 相似度阈值
     pub similarity_threshold: u32,
+}
+
+/// 文件夹统计信息
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FolderStats {
+    /// 总文件数
+    pub total_files: usize,
+    /// 图像文件数
+    pub image_count: usize,
+    /// 文件夹数（包括子文件夹）
+    pub folder_count: usize,
+}
+
+/// 获取文件夹的统计信息（文件总数、图像数等）
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_folder_stats(folder_path: String, recursive: bool) -> Result<FolderStats, String> {
+    let path = Path::new(&folder_path);
+
+    if !path.exists() || !path.is_dir() {
+        return Err(format!("无效的文件夹路径: {}", folder_path));
+    }
+
+    let mut stats = FolderStats {
+        total_files: 0,
+        image_count: 0,
+        folder_count: 1, // 包括当前文件夹
+    };
+
+    // 如果递归，使用WalkDir遍历所有子目录和文件
+    if recursive {
+        for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
+            if entry.path() == path {
+                continue; // 跳过当前文件夹自身
+            }
+            
+            if entry.path().is_dir() {
+                stats.folder_count += 1;
+            } else if entry.path().is_file() {
+                stats.total_files += 1;
+                
+                // 检查是否为图像文件
+                if crate::core::utils::file_utils::is_image_file(entry.path()) {
+                    stats.image_count += 1;
+                }
+            }
+        }
+    } else {
+        // 不递归，只遍历顶层目录
+        
+        // 读取目录内容
+        for entry in std::fs::read_dir(path).map_err(|e| e.to_string())? {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                
+                if path.is_file() {
+                    stats.total_files += 1;
+                    
+                    // 检查是否为图像文件
+                    if crate::core::utils::file_utils::is_image_file(&path) {
+                        stats.image_count += 1;
+                    }
+                } else if path.is_dir() {
+                    stats.folder_count += 1;
+                }
+            }
+        }
+    }
+
+    Ok(stats)
 }

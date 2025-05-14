@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::fs;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use rayon::prelude::*;
 use crate::core::types::{HashAlgorithm, HashResult, DuplicateGroup, ImageInfo};
 use crate::core::utils::file_utils::{get_image_paths, get_file_metadata};
@@ -45,7 +46,11 @@ pub fn detect_duplicates(params: &DuplicateDetectionParams) -> Result<Vec<Duplic
         params.threshold
     )?;
     
-    Ok(duplicate_groups)
+    // 4. 按组大小排序，最大的组在最前面
+    let mut sorted_groups = duplicate_groups;
+    sorted_groups.sort_by(|a, b| b.images.len().cmp(&a.images.len()));
+    
+    Ok(sorted_groups)
 }
 
 /// 并行计算所有图像的哈希值
@@ -53,30 +58,74 @@ fn compute_image_hashes(
     paths: &[PathBuf],
     algorithm: HashAlgorithm
 ) -> Result<Vec<HashResult>, String> {
-    // 使用Rayon并行计算哈希值
-    let results: Vec<Result<HashResult, String>> = paths.par_iter()
-        .map(|path| algorithms::calculate_hash(path, algorithm))
-        .collect();
-    
-    // 过滤出成功的结果
-    let mut hashes = Vec::with_capacity(paths.len());
-    let mut error_count = 0;
-    
-    for (i, result) in results.into_iter().enumerate() {
-        match result {
-            Ok(hash) => hashes.push(hash),
-            Err(e) => {
-                error_count += 1;
-                eprintln!("处理图像失败 {}: {}", paths[i].display(), e);
-            }
-        }
+    if paths.is_empty() {
+        return Ok(Vec::new());
     }
     
-    if !hashes.is_empty() {
-        if error_count > 0 {
-            eprintln!("注意: {} 个图像处理失败，已忽略", error_count);
+    // 批量处理提高性能
+    const BATCH_SIZE: usize = 500;
+    
+    // 创建线程安全的结果容器
+    let hashes = Arc::new(Mutex::new(Vec::with_capacity(paths.len())));
+    let error_count = Arc::new(Mutex::new(0));
+    
+    // 分批并行处理
+    paths.chunks(BATCH_SIZE).par_bridge().for_each(|batch| {
+        let batch_results: Vec<(usize, Result<HashResult, String>)> = batch.par_iter().enumerate()
+            .map(|(local_idx, path)| {
+                // 计算哈希并记录原始索引
+                let global_idx = local_idx + 
+                    batch.as_ptr() as usize - paths.as_ptr() as usize;
+                
+                (global_idx, algorithms::calculate_hash(path, algorithm))
+            })
+            .collect();
+        
+        // 合并批次结果
+        let mut hashes_lock = hashes.lock().unwrap();
+        let mut error_lock = error_count.lock().unwrap();
+        
+        for (idx, result) in batch_results {
+            match result {
+                Ok(hash) => {
+                    // 确保向量有足够的空间
+                    if hashes_lock.len() <= idx {
+                        hashes_lock.resize_with(idx + 1, || {
+                            HashResult {
+                                hash: String::new(),
+                                width: 0,
+                                height: 0,
+                            }
+                        });
+                    }
+                    hashes_lock[idx] = hash;
+                },
+                Err(e) => {
+                    *error_lock += 1;
+                    eprintln!("处理图像失败 {}: {}", paths[idx].display(), e);
+                }
+            }
         }
-        Ok(hashes)
+    });
+    
+    // 获取最终结果
+    let final_hashes = Arc::try_unwrap(hashes)
+        .expect("无法获取锁")
+        .into_inner()
+        .expect("锁被毒化");
+    
+    let final_error_count = *error_count.lock().unwrap();
+    
+    // 过滤掉空哈希值（处理失败的图像对应位置）
+    let valid_hashes: Vec<HashResult> = final_hashes.into_iter()
+        .filter(|h| !h.hash.is_empty())
+        .collect();
+    
+    if !valid_hashes.is_empty() {
+        if final_error_count > 0 {
+            eprintln!("注意: {} 个图像处理失败，已忽略", final_error_count);
+        }
+        Ok(valid_hashes)
     } else {
         Err("所有图像处理均失败".to_string())
     }
@@ -89,12 +138,13 @@ fn find_duplicate_groups(
     algorithm: HashAlgorithm,
     threshold: f32
 ) -> Result<Vec<DuplicateGroup>, String> {
-    if hashes.is_empty() || paths.len() != hashes.len() {
-        return Err("哈希值与路径数量不匹配".to_string());
+    if hashes.is_empty() {
+        return Ok(Vec::new());
     }
     
-    let mut groups = Vec::new();
-    let mut used = vec![false; hashes.len()];
+    if paths.len() != hashes.len() {
+        return Err(format!("哈希值({})与路径({})数量不匹配", hashes.len(), paths.len()));
+    }
     
     // 提取所有哈希字符串用于LSH算法
     let hash_strings: Vec<String> = hashes.iter().map(|h| h.hash.clone()).collect();
@@ -102,85 +152,66 @@ fn find_duplicate_groups(
     // 使用LSH算法快速找到可能的候选对
     let candidate_pairs = compute_candidate_pairs(&hash_strings, algorithm);
     
-    // 构建每个图像的候选集
-    let mut similarity_cache = HashMap::new();
-    let mut candidate_map: HashMap<usize, Vec<usize>> = HashMap::new();
+    // 并行计算所有候选对的相似度
+    let similarity_results: Vec<((usize, usize), f32)> = candidate_pairs
+        .par_iter()
+        .map(|&(i, j)| {
+            let hash1 = &hash_strings[i];
+            let hash2 = &hash_strings[j];
+            let similarity = algorithms::calculate_similarity(hash1, hash2, algorithm);
+            ((i, j), similarity)
+        })
+        .filter(|(_, similarity)| *similarity >= threshold)
+        .collect();
     
-    for (i, j) in candidate_pairs {
-        // 计算相似度
-        let hash1 = &hash_strings[i];
-        let hash2 = &hash_strings[j];
-        
-        let cache_key = if hash1 < hash2 {
-            format!("{}{}", hash1, hash2)
-        } else {
-            format!("{}{}", hash2, hash1)
-        };
-        
-        let similarity = if let Some(&sim) = similarity_cache.get(&cache_key) {
-            sim
-        } else {
-            let sim = algorithms::calculate_similarity(hash1, hash2, algorithm);
-            similarity_cache.insert(cache_key, sim);
-            sim
-        };
-        
-        // 如果相似度高于阈值，添加到候选集
-        if similarity >= threshold {
-            candidate_map.entry(i).or_insert_with(Vec::new).push(j);
-            candidate_map.entry(j).or_insert_with(Vec::new).push(i);
-        }
+    // 使用并查集算法构建连通分量（相似图像组）
+    let mut disjoint_set = DisjointSet::new(hashes.len());
+    
+    // 合并相似的图像对
+    for ((i, j), _) in &similarity_results {
+        disjoint_set.union(*i, *j);
     }
     
-    // 构建重复图像组
+    // 从并查集构建组
+    let mut group_map: HashMap<usize, Vec<usize>> = HashMap::new();
     for i in 0..hashes.len() {
-        if used[i] {
+        let root = disjoint_set.find(i);
+        group_map.entry(root).or_insert_with(Vec::new).push(i);
+    }
+    
+    // 过滤并构建最终的重复组
+    let mut groups = Vec::new();
+    
+    for (_, indices) in group_map.iter() {
+        // 只处理大于1的组（实际重复）
+        if indices.len() <= 1 {
             continue;
-        }
-        
-        // 获取第i个图像的所有候选匹配
-        let candidates = match candidate_map.get(&i) {
-            Some(c) => c,
-            None => continue, // 没有候选，继续下一个
-        };
-        
-        if candidates.is_empty() {
-            continue;
-        }
-        
-        // 创建一个新组
-        let mut group_indices = vec![i];
-        used[i] = true;
-        
-        // 添加所有未使用的候选匹配
-        for &j in candidates {
-            if !used[j] {
-                group_indices.push(j);
-                used[j] = true;
-            }
         }
         
         // 收集组内所有图像信息
-        let mut images = Vec::with_capacity(group_indices.len());
+        let images: Vec<ImageInfo> = indices.par_iter()
+            .filter_map(|&idx| {
+                let path = &paths[idx];
+                let hash_result = &hashes[idx];
+                
+                match get_file_metadata(path) {
+                    Ok((size_bytes, created_at, modified_at)) => {
+                        Some(ImageInfo {
+                            path: path.to_string_lossy().into_owned(),
+                            hash: hash_result.hash.clone(),
+                            width: hash_result.width,
+                            height: hash_result.height,
+                            size_bytes,
+                            created_at,
+                            modified_at,
+                        })
+                    },
+                    Err(_) => None
+                }
+            })
+            .collect();
         
-        for &idx in &group_indices {
-            let path = &paths[idx];
-            let hash_result = &hashes[idx];
-            
-            if let Ok((size_bytes, created_at, modified_at)) = get_file_metadata(path) {
-                images.push(ImageInfo {
-                    path: path.to_string_lossy().into_owned(),
-                    hash: hash_result.hash.clone(),
-                    width: hash_result.width,
-                    height: hash_result.height,
-                    size_bytes,
-                    created_at,
-                    modified_at,
-                });
-            }
-        }
-        
-        // 如果组内有多个图像，添加到结果中
+        // 如果组内有多个有效图像，添加到结果中
         if images.len() > 1 {
             groups.push(DuplicateGroup {
                 images,
@@ -189,10 +220,57 @@ fn find_duplicate_groups(
         }
     }
     
-    // 按照组大小排序，最大组在前
-    groups.sort_by(|a, b| b.images.len().cmp(&a.images.len()));
-    
     Ok(groups)
+}
+
+/// 并查集数据结构，用于高效地构建连通分量
+struct DisjointSet {
+    parent: Vec<usize>,
+    rank: Vec<usize>,
+}
+
+impl DisjointSet {
+    fn new(size: usize) -> Self {
+        let mut parent = Vec::with_capacity(size);
+        let rank = vec![0; size];
+        
+        // 初始化，每个元素都是自己的父节点
+        for i in 0..size {
+            parent.push(i);
+        }
+        
+        Self { parent, rank }
+    }
+    
+    /// 查找元素所属的集合代表
+    fn find(&mut self, x: usize) -> usize {
+        if self.parent[x] != x {
+            // 路径压缩：将x的父节点直接设为根节点
+            self.parent[x] = self.find(self.parent[x]);
+        }
+        self.parent[x]
+    }
+    
+    /// 合并两个元素所在的集合
+    fn union(&mut self, x: usize, y: usize) {
+        let root_x = self.find(x);
+        let root_y = self.find(y);
+        
+        if root_x == root_y {
+            return; // 已经在同一集合中
+        }
+        
+        // 按秩合并：将秩较小的树连接到秩较大的树上
+        if self.rank[root_x] < self.rank[root_y] {
+            self.parent[root_x] = root_y;
+        } else if self.rank[root_x] > self.rank[root_y] {
+            self.parent[root_y] = root_x;
+        } else {
+            // 秩相同，任意方向合并，并增加秩
+            self.parent[root_y] = root_x;
+            self.rank[root_x] += 1;
+        }
+    }
 }
 
 /// 检查两张图片是否可能是重复的
@@ -203,6 +281,33 @@ pub fn are_images_duplicates(
     algorithm: HashAlgorithm,
     threshold: f32
 ) -> Result<bool, String> {
+    // 快速检查：如果是同一个文件，直接返回true
+    if img1_path.canonicalize().ok() == img2_path.canonicalize().ok() {
+        return Ok(true);
+    }
+    
+    // 检查文件大小（可选的快速过滤）
+    if let (Ok(metadata1), Ok(metadata2)) = (fs::metadata(img1_path), fs::metadata(img2_path)) {
+        // 如果文件大小差异超过50%，则不太可能是重复的（可选性能优化）
+        if metadata1.len() > 0 && metadata2.len() > 0 {
+            let size_ratio = if metadata1.len() > metadata2.len() {
+                metadata1.len() as f64 / metadata2.len() as f64
+            } else {
+                metadata2.len() as f64 / metadata1.len() as f64
+            };
+            
+            // 对于精确匹配算法，文件大小必须完全相同
+            if algorithm == HashAlgorithm::Exact && metadata1.len() != metadata2.len() {
+                return Ok(false);
+            }
+            
+            // 对于其他算法，如果大小差异过大，可能不是重复的
+            if algorithm != HashAlgorithm::Exact && size_ratio > 2.0 {
+                return Ok(false);
+            }
+        }
+    }
+    
     // 计算两张图片的哈希值
     let hash1 = algorithms::calculate_hash(img1_path, algorithm)?;
     let hash2 = algorithms::calculate_hash(img2_path, algorithm)?;

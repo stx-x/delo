@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, computed, watch, inject } from "vue";
+import { ref, onMounted, computed, watch, inject, onUnmounted } from "vue";
 import { useRouter, useRoute } from "vue-router";
 
 const router = useRouter();
@@ -18,6 +18,14 @@ const state = ref({
     previewImage: null,
     currentGroupIndex: 0,
     currentImageIndex: 0,
+    showBackToTop: false,
+    showGroupNav: false,
+    scanStats: {
+        totalFolders: 0,
+        totalFiles: 0,
+        totalImages: 0,
+        processedImages: 0,
+    },
 });
 
 // 计算属性
@@ -30,7 +38,19 @@ const selectedCount = computed(() => {
 // 初始化组件
 onMounted(() => {
     loadData();
+    // 初始化滚动状态
+    handleScroll();
 });
+
+// 滚动到指定分组
+const scrollToGroup = (groupIndex) => {
+    const element = document.getElementById(`group-${groupIndex}`);
+    if (element) {
+        element.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        // 滚动后立即隐藏导航菜单，不需要延迟
+        groupNavVisible.value = false;
+    }
+};
 
 // 监听路由参数变化
 watch(
@@ -39,6 +59,99 @@ watch(
         loadData();
     },
 );
+
+// 监听滚动位置，显示/隐藏返回顶部按钮
+onMounted(() => {
+    window.addEventListener('scroll', handleScroll);
+});
+
+// 已在上面重新定义了事件监听，这里移除
+
+// 分组导航显示状态
+const groupNavVisible = ref(false);
+
+// 是否在页面底部
+const isAtBottom = ref(false);
+
+// 监听窗口大小变化和滚动事件，更新底部检测
+onMounted(() => {
+    window.addEventListener('resize', handleScroll);
+    window.addEventListener('scroll', handleScroll);
+});
+
+onUnmounted(() => {
+    window.removeEventListener('resize', handleScroll);
+    window.removeEventListener('scroll', handleScroll);
+});
+
+// 处理滚动事件
+const handleScroll = () => {
+    // 当前滚动位置
+    const scrollPosition = window.scrollY;
+    const windowHeight = window.innerHeight;
+    const scrollHeight = document.documentElement.scrollHeight;
+    
+    // 顶部按钮显示逻辑 - 滚动超过300px显示
+    state.value.showBackToTop = scrollPosition > 300;
+    
+    // 分组导航显示逻辑 - 滚动超过300px且有足够分组时显示
+    state.value.showGroupNav = scrollPosition > 300 && state.value.duplicateGroups.length > 3;
+    
+    // 检测是否滚动到底部 - 使用更严格的判断
+    // 如果滚动位置 + 窗口高度接近文档总高度，认为到达底部
+    // 添加30px的缓冲区以提高用户体验
+    isAtBottom.value = scrollHeight - (scrollPosition + windowHeight) < 30;
+    
+    // 更新当前可见分组索引（用于导航菜单高亮）
+    updateCurrentVisibleGroup();
+    
+    // 如果页面刚加载且没有滚动，但内容很短，需要默认隐藏底部按钮
+    if (scrollPosition === 0 && scrollHeight <= windowHeight + 100) {
+        isAtBottom.value = true;
+    }
+};
+
+// 更新当前可见分组索引
+const updateCurrentVisibleGroup = () => {
+    if (state.value.duplicateGroups.length === 0) return;
+    
+    // 查找当前视口中最靠上的分组
+    for (let i = 0; i < state.value.duplicateGroups.length; i++) {
+        const element = document.getElementById(`group-${i}`);
+        if (element) {
+            const rect = element.getBoundingClientRect();
+            // 如果元素的顶部在视口中，或者刚刚超出视口但底部仍可见
+            if (rect.top <= 150 && rect.bottom > 0) {
+                state.value.currentGroupIndex = i;
+                return;
+            }
+        }
+    }
+};
+
+// 滚动到顶部
+const scrollToTop = () => {
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+};
+
+// 显示分组导航
+const showGroupNav = () => {
+    groupNavVisible.value = true;
+};
+
+// 隐藏分组导航
+const hideGroupNav = () => {
+    // 立即隐藏导航菜单
+    groupNavVisible.value = false;
+};
+
+// 滚动到底部
+const scrollToBottom = () => {
+    window.scrollTo({ 
+        top: document.documentElement.scrollHeight, 
+        behavior: 'smooth' 
+    });
+};
 
 // 加载数据
 const loadData = async () => {
@@ -53,6 +166,19 @@ const loadData = async () => {
             .map(processGroup)
             .filter(Boolean);
         state.value.selectedFolders = globalState.selectedFolders || [];
+
+        // 加载扫描统计信息
+        if (globalState.scanStats) {
+            state.value.scanStats = globalState.scanStats;
+        } else {
+            // 如果没有全局统计信息，尝试计算一些基本数据
+            state.value.scanStats = {
+                totalFolders: state.value.selectedFolders.length,
+                totalFiles: 0, // 无法确定，显示为0
+                totalImages: 0, // 将在后面更新
+                processedImages: 0, // 将在后面更新
+            };
+        }
 
         // 初始化选择状态
         state.value.duplicateGroups.forEach((group, groupIndex) => {
@@ -70,6 +196,20 @@ const loadData = async () => {
             (sum, group) => sum + group.images.length,
             0,
         );
+            
+        // 更新处理过的重复图像数
+        state.value.scanStats.processedImages = totalDuplicates;
+            
+        // 如果globalState中没有totalImages，则计算唯一图像数
+        if (!state.value.scanStats.totalImages) {
+            // 计算所有唯一图像数量
+            const uniqueImagePaths = new Set();
+            state.value.duplicateGroups.forEach(group => {
+                group.images.forEach(img => uniqueImagePaths.add(img.path));
+            });
+            state.value.scanStats.totalImages = uniqueImagePaths.size;
+        }
+        
         state.value.processingStatus = `处理完成，共找到 ${totalDuplicates} 张存在重复的图片，分为 ${state.value.duplicateGroups.length} 组`;
     } catch (err) {
         console.error("加载数据失败:", err);
@@ -573,8 +713,58 @@ const processGroup = (group) => {
         transform: translateY(0);
     }
 }
+@keyframes slideIn {
+    from {
+        opacity: 0;
+        transform: translateX(-20px);
+    }
+    to {
+        opacity: 1;
+        transform: translateX(0);
+    }
+}
+@keyframes slideOut {
+    from {
+        opacity: 1;
+        transform: translateX(0);
+    }
+    to {
+        opacity: 0;
+        transform: translateX(-20px);
+    }
+}
 .animate-fade-in {
     animation: fadeIn 0.5s ease forwards;
+}
+.animate-slide-in {
+    animation: slideIn 0.3s ease forwards;
+}
+.animate-slide-out {
+    animation: slideOut 0.3s ease forwards;
+}
+.fade-enter-active, .fade-leave-active {
+    transition: opacity 0.3s, transform 0.3s;
+}
+.fade-enter-from, .fade-leave-to {
+    opacity: 0;
+    transform: translateY(10px);
+}
+.scrollbar-thin {
+    scrollbar-width: thin;
+}
+.scrollbar-thin::-webkit-scrollbar {
+    width: 4px;
+}
+.scrollbar-thin::-webkit-scrollbar-track {
+    background: #f1f1f1;
+    border-radius: 4px;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+    background: #888;
+    border-radius: 4px;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb:hover {
+    background: #555;
 }
 </style>
 
@@ -655,9 +845,90 @@ const processGroup = (group) => {
                     v-if="state.processingStatus"
                     class="p-4 bg-slate-50 rounded-lg border border-slate-200"
                 >
-                    <p class="text-sm text-slate-600">
-                        {{ state.processingStatus }}
-                    </p>
+                    <div class="flex flex-col gap-2">
+                        <p class="text-sm text-slate-600">
+                            {{ state.processingStatus }}
+                        </p>
+                        <!-- 扫描统计信息 -->
+                        <div class="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-6 gap-4 mt-2">
+                            <div class="bg-white p-3 rounded-lg shadow-sm flex items-center gap-3">
+                                <div class="bg-blue-100 p-2 rounded-lg">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-blue-600">
+                                        <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"></path>
+                                    </svg>
+                                </div>
+                                <div>
+                                    <p class="text-xs text-slate-500">文件夹数</p>
+                                    <p class="text-lg font-semibold">{{ state.scanStats.totalFolders || state.selectedFolders.length }}</p>
+                                </div>
+                            </div>
+                            <div class="bg-white p-3 rounded-lg shadow-sm flex items-center gap-3">
+                                <div class="bg-green-100 p-2 rounded-lg">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-green-600">
+                                        <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"></path>
+                                        <polyline points="14 2 14 8 20 8"></polyline>
+                                    </svg>
+                                </div>
+                                <div>
+                                    <p class="text-xs text-slate-500">总文件数</p>
+                                    <p class="text-lg font-semibold">{{ state.scanStats.totalFiles || '-' }}</p>
+                                </div>
+                            </div>
+                            <div class="bg-white p-3 rounded-lg shadow-sm flex items-center gap-3">
+                                <div class="bg-purple-100 p-2 rounded-lg">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-purple-600">
+                                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                                        <circle cx="8.5" cy="8.5" r="1.5"></circle>
+                                        <polyline points="21 15 16 10 5 21"></polyline>
+                                    </svg>
+                                </div>
+                                <div>
+                                    <p class="text-xs text-slate-500">图像总数</p>
+                                    <p class="text-lg font-semibold">{{ state.scanStats.totalImages }}</p>
+                                </div>
+                            </div>
+                            <div class="bg-white p-3 rounded-lg shadow-sm flex items-center gap-3">
+                                <div class="bg-amber-100 p-2 rounded-lg">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-amber-600">
+                                        <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                                        <circle cx="9" cy="7" r="4"></circle>
+                                        <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+                                        <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+                                    </svg>
+                                </div>
+                                <div>
+                                    <p class="text-xs text-slate-500">重复图像</p>
+                                    <p class="text-lg font-semibold">{{ state.scanStats.processedImages }}</p>
+                                </div>
+                            </div>
+                            <div class="bg-white p-3 rounded-lg shadow-sm flex items-center gap-3">
+                                <div class="bg-indigo-100 p-2 rounded-lg">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-indigo-600">
+                                        <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"></path>
+                                        <circle cx="12" cy="12" r="3"></circle>
+                                    </svg>
+                                </div>
+                                <div>
+                                    <p class="text-xs text-slate-500">使用算法</p>
+                                    <p class="text-lg font-semibold">{{ globalState.algorithm }}</p>
+                                </div>
+                            </div>
+                            <div class="bg-white p-3 rounded-lg shadow-sm flex items-center gap-3" v-if="globalState.algorithm !== 'Exact'">
+                                <div class="bg-teal-100 p-2 rounded-lg">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-teal-600">
+                                        <path d="M2 12h10"></path>
+                                        <path d="M9 4v16"></path>
+                                        <path d="M14 9h2a2 2 0 0 1 2 2v2a2 2 0 0 1-2 2h-2"></path>
+                                        <path d="M22 16a6 6 0 0 1-6 6"></path>
+                                    </svg>
+                                </div>
+                                <div>
+                                    <p class="text-xs text-slate-500">相似度阈值</p>
+                                    <p class="text-lg font-semibold">{{ globalState.similarityThreshold }}%</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
                 </div>
 
                 <!-- 工具栏 -->
@@ -769,15 +1040,19 @@ const processGroup = (group) => {
                 </div>
             </div>
 
+            <!-- 分组导航菜单 -->
+            <!-- 移除顶部快速跳转分组组件，统一使用左侧悬浮导航 -->
+    
             <!-- 显示重复图片组 -->
-            <div
-                v-if="state.duplicateGroups.length > 0"
-                class="mt-4 animate-fade-in"
-            >
-                <div class="flex flex-col gap-8">
+                    <div
+                        v-if="state.duplicateGroups.length > 0"
+                        class="mt-4 animate-fade-in relative"
+                    >
+                        <div class="flex flex-col gap-8">
                     <div
                         v-for="(group, groupIndex) in state.duplicateGroups"
                         :key="groupIndex"
+                        :id="`group-${groupIndex}`"
                         class="bg-white rounded-xl shadow-sm overflow-hidden border border-slate-200 transition-all hover:shadow-md"
                     >
                         <div
@@ -819,7 +1094,7 @@ const processGroup = (group) => {
                         </div>
 
                         <div
-                            class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 p-6"
+                            class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 p-6"
                         >
                             <div
                                 v-for="(image, imageIndex) in group.images"
@@ -1209,6 +1484,121 @@ const processGroup = (group) => {
                             删除此图片
                         </button>
                     </div>
+                </div>
+            </div>
+        </div>
+        <!-- 顶部/底部导航按钮 -->
+        <div class="fixed right-6 bottom-6 flex flex-col gap-3 z-40">
+                    <transition name="fade">
+                        <button 
+                            v-if="state.showBackToTop && !groupNavVisible"
+                            @click="scrollToTop"
+                            class="bg-white w-12 h-12 rounded-full shadow-lg flex items-center justify-center text-slate-600 hover:bg-slate-50 hover:text-blue-600 transform hover:scale-110 transition-all duration-300"
+                            title="返回顶部"
+                            aria-label="返回顶部"
+                        >
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="m18 15-6-6-6 6"/>
+                            </svg>
+                        </button>
+                    </transition>
+                    <transition name="fade">
+                        <button 
+                            v-if="!isAtBottom && state.duplicateGroups.length > 0 && !groupNavVisible"
+                            @click="scrollToBottom"
+                            class="bg-white w-12 h-12 rounded-full shadow-lg flex items-center justify-center text-slate-600 hover:bg-slate-50 hover:text-blue-600 transform hover:scale-110 transition-all duration-300"
+                            title="滚动到底部"
+                            aria-label="滚动到底部"
+                        >
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="m6 9 6 6 6-6"/>
+                            </svg>
+                        </button>
+                    </transition>
+                </div>
+        
+        <!-- 分组悬浮导航（滚动时显示） -->
+        <div
+            v-if="state.duplicateGroups.length > 3" 
+            class="fixed left-6 top-1/2 -translate-y-1/2 z-40"
+            @mouseenter="showGroupNav"
+            @mouseleave="hideGroupNav"
+        >
+            <div v-if="!groupNavVisible && state.showGroupNav" class="bg-white rounded-full shadow-xl p-3 border border-slate-200 cursor-pointer hover:bg-blue-50 transition-all duration-300 animate-fade-in" @click="showGroupNav">
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-blue-600">
+                    <path d="M3 9h18v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9Z"></path>
+                    <path d="m3 9 2.45-4.9A2 2 0 0 1 7.24 3h9.52a2 2 0 0 1 1.8 1.1L21 9"></path>
+                    <path d="M12 3v6"></path>
+                </svg>
+            </div>
+            <div v-else-if="groupNavVisible" class="bg-white rounded-xl shadow-xl p-4 border border-slate-200 animate-slide-in transition-all duration-300">
+                <h3 class="text-sm font-medium text-slate-700 mb-3 px-1 flex items-center justify-between">
+                    <span>分组导航</span> 
+                    <span class="text-xs bg-blue-50 text-blue-600 px-2 py-0.5 rounded-full">共{{ state.duplicateGroups.length }}组</span>
+                </h3>
+                
+                <div class="overflow-y-auto scrollbar-thin p-1" 
+                     :style="{ 
+                         maxHeight: state.duplicateGroups.length > 30 ? '350px' : 
+                                  state.duplicateGroups.length > 15 ? '300px' : 'auto' 
+                     }">
+                    <!-- 分组网格布局 - 根据分组数量动态调整列数 -->
+                    <div class="grid gap-2 mb-1"
+                         :class="{
+                             'grid-cols-3': state.duplicateGroups.length <= 12,
+                             'grid-cols-4': state.duplicateGroups.length > 12 && state.duplicateGroups.length <= 50,
+                             'grid-cols-5': state.duplicateGroups.length > 50
+                         }">
+                        <button
+                            v-for="(group, index) in state.duplicateGroups"
+                            :key="index"
+                            @click="scrollToGroup(index)"
+                            :class="{
+                                'px-2 py-1.5 text-sm rounded-lg transition-all duration-200 flex items-center justify-center transform hover:scale-105': true,
+                                'bg-blue-100 text-blue-700 font-medium': index === state.currentGroupIndex,
+                                'bg-slate-100 hover:bg-blue-100 hover:text-blue-700 text-slate-700': index !== state.currentGroupIndex
+                            }"
+                            :title="`跳转到分组 #${index + 1} (${group.images.length}张图片)`"
+                        >
+                            {{ index + 1 }}
+                        </button>
+                    </div>
+                </div>
+                
+                <!-- 底部操作栏 -->
+                <div class="flex justify-between items-center mt-3 pt-3 border-t border-slate-200">
+                    <div class="flex gap-2">
+                        <button
+                            @click="scrollToTop"
+                            class="px-2 py-1 text-xs bg-blue-50 text-blue-600 hover:bg-blue-100 rounded-md flex items-center gap-1 shadow-sm transition-all hover:shadow"
+                            title="返回顶部"
+                        >
+                            <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="m18 15-6-6-6 6"/>
+                            </svg>
+                            顶部
+                        </button>
+                        <button
+                            @click="scrollToBottom"
+                            class="px-2 py-1 text-xs bg-blue-50 text-blue-600 hover:bg-blue-100 rounded-md flex items-center gap-1 shadow-sm transition-all hover:shadow"
+                            title="滚动到底部"
+                        >
+                            底部
+                            <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="m6 9 6 6 6-6"/>
+                            </svg>
+                        </button>
+                    </div>
+                    <button 
+                        @click="hideGroupNav" 
+                        class="p-1 text-xs bg-slate-100 text-slate-600 hover:bg-slate-200 rounded-md flex items-center shadow-sm"
+                        title="关闭导航"
+                    >
+                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <line x1="18" y1="6" x2="6" y2="18"></line>
+                            <line x1="6" y1="6" x2="18" y2="18"></line>
+                        </svg>
+                    </button>
                 </div>
             </div>
         </div>

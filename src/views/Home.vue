@@ -1,5 +1,5 @@
 <script setup>
-import { ref, inject, onMounted } from "vue";
+import { ref, inject, onMounted, computed } from "vue";
 import { useRouter } from "vue-router";
 import { open } from "@tauri-apps/plugin-dialog";
 
@@ -15,6 +15,9 @@ const recursive = ref(true);
 const loading = ref(false);
 const showAdvanced = ref(false);
 const invoke = window.__TAURI__.core.invoke;
+
+// 计算是否为精确哈希算法
+const isExactAlgorithm = computed(() => algorithm.value === "Exact");
 
 // 初始化状态
 onMounted(() => {
@@ -100,15 +103,52 @@ const startProcessing = async () => {
     processingStatus.value = "正在扫描图片...";
 
     try {
+        // 首先获取总的文件和文件夹统计信息
+        const scanStats = {
+            totalFolders: 0,  // 将包括子文件夹总数
+            totalFiles: 0,
+            totalImages: 0,
+            processedImages: 0,
+        };
+
+        // 获取总文件和图像数
+        for (const folder of selectedFolders.value) {
+            try {
+                processingStatus.value = `正在统计文件夹 ${formatPath(folder)} 中的文件...`;
+                const stats = await invoke("get_folder_stats", {
+                    folder_path: folder,
+                    recursive: recursive.value
+                });
+                
+                if (stats) {
+                    scanStats.totalFolders += stats.folder_count || 0;
+                    scanStats.totalFiles += stats.total_files || 0;
+                    scanStats.totalImages += stats.image_count || 0;
+                }
+            } catch (e) {
+                console.warn(`获取文件夹 ${folder} 统计信息失败:`, e);
+            }
+        }
+
+        processingStatus.value = `找到 ${scanStats.totalFiles} 个文件，其中 ${scanStats.totalImages} 张图片，正在查找重复...`;
+
         // 准备请求参数并包装在req对象中
         const duplicateGroups = await invoke("find_duplicates", {
             req: {
                 folder_paths: selectedFolders.value,
                 algorithm: algorithm.value,
-                similarity_threshold: Number(similarityThreshold.value),
+                similarity_threshold: isExactAlgorithm.value ? 100 : Number(similarityThreshold.value),
                 recursive: recursive.value,
             },
         });
+
+        // 更新处理的图像数量
+        if (duplicateGroups && duplicateGroups.length > 0) {
+            scanStats.processedImages = duplicateGroups.reduce(
+                (sum, group) => sum + (group.images ? group.images.length : 0),
+                0
+            );
+        }
 
         // 保存到全局状态
         globalState.duplicateGroups = duplicateGroups;
@@ -116,6 +156,7 @@ const startProcessing = async () => {
         globalState.algorithm = algorithm.value;
         globalState.similarityThreshold = similarityThreshold.value;
         globalState.recursive = recursive.value;
+        globalState.scanStats = scanStats;
 
         // 导航到结果页
         router.push({
@@ -401,7 +442,7 @@ const toggleAdvanced = () => {
                     </div>
 
                     <!-- 相似度阈值 -->
-                    <div class="mb-5">
+                    <div class="mb-5" v-if="!isExactAlgorithm">
                         <label
                             class="block text-lg font-semibold text-slate-800 mb-3 flex items-center gap-2 group"
                         >
@@ -851,9 +892,9 @@ const toggleAdvanced = () => {
                     </div>
 
                     <!-- 相似度阈值 -->
-                    <div class="mb-5">
+                    <div class="mb-5 pb-5 border-b border-slate-200" v-if="!isExactAlgorithm">
                         <label
-                            class="block text-sm font-medium text-slate-700 mb-3 flex items-center gap-2"
+                            class="block mb-2 font-medium text-slate-800 flex items-center gap-2"
                         >
                             <svg
                                 xmlns="http://www.w3.org/2000/svg"
