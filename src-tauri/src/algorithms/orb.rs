@@ -27,9 +27,19 @@ pub fn calculate_orb_features(path: &Path) -> Result<HashResult, String> {
     // 转换为灰度图
     let gray_img = image_utils::to_grayscale(&img);
     
-    // 检测FAST角点
-    let keypoints = detect_fast_keypoints(&gray_img, 20, 500)?;
+    // 检测FAST角点，确保返回固定数量的特征点
+    let max_keypoints = 50; // 限制最大特征点数量
+    let mut keypoints = detect_fast_keypoints(&gray_img, 20, max_keypoints)?;
     
+    // 如果特征点太少，降低阈值重试
+    if keypoints.len() < max_keypoints / 2 {
+        keypoints = detect_fast_keypoints(&gray_img, 15, max_keypoints)?;
+        if keypoints.len() < max_keypoints / 2 {
+            keypoints = detect_fast_keypoints(&gray_img, 10, max_keypoints)?;
+        }
+    }
+    
+    // 如果仍然没有足够的特征点，返回错误
     if keypoints.is_empty() {
         return Err(format!("在图像中未检测到特征点: {}", path.display()));
     }
@@ -40,8 +50,13 @@ pub fn calculate_orb_features(path: &Path) -> Result<HashResult, String> {
     // 计算BRIEF描述子
     let descriptors = compute_brief_descriptors(&gray_img, &oriented_keypoints);
     
+    // 确保描述子数量不超过限制
+    let limited_descriptors: Vec<Descriptor> = descriptors.into_iter()
+        .take(max_keypoints)
+        .collect();
+    
     // 将结果序列化为字符串
-    let features_str = serialize_features(&descriptors);
+    let features_str = serialize_features(&limited_descriptors);
     
     Ok(HashResult {
         hash: features_str,
@@ -414,14 +429,12 @@ fn serialize_features(descriptors: &[Descriptor]) -> String {
     // 将特征点信息转换为二进制数据
     let mut data = Vec::new();
     
-    // 存储描述子数量
-    let count = descriptors.len().min(50); // 最多保存50个特征点
+    // 存储描述子数量（固定为实际数量）
+    let count = descriptors.len();
     data.extend_from_slice(&(count as u32).to_le_bytes());
     
     // 存储每个描述子
-    for i in 0..count {
-        let desc = &descriptors[i];
-        
+    for desc in descriptors {
         // 存储位置和角度
         data.extend_from_slice(&desc.x.to_le_bytes());
         data.extend_from_slice(&desc.y.to_le_bytes());

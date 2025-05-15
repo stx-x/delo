@@ -65,8 +65,8 @@ fn compute_image_hashes(
     // 批量处理提高性能
     const BATCH_SIZE: usize = 500;
     
-    // 创建线程安全的结果容器
-    let hashes = Arc::new(Mutex::new(Vec::with_capacity(paths.len())));
+    // 创建固定大小的结果向量，初始化为None
+    let results = Arc::new(Mutex::new(vec![None; paths.len()]));
     let error_count = Arc::new(Mutex::new(0));
     
     // 分批并行处理
@@ -75,30 +75,20 @@ fn compute_image_hashes(
             .map(|(local_idx, path)| {
                 // 计算哈希并记录原始索引
                 let global_idx = local_idx + 
-                    batch.as_ptr() as usize - paths.as_ptr() as usize;
+                    (batch.as_ptr() as usize - paths.as_ptr() as usize) / std::mem::size_of::<PathBuf>();
                 
                 (global_idx, algorithms::calculate_hash(path, algorithm))
             })
             .collect();
         
         // 合并批次结果
-        let mut hashes_lock = hashes.lock().unwrap();
+        let mut results_lock = results.lock().unwrap();
         let mut error_lock = error_count.lock().unwrap();
         
         for (idx, result) in batch_results {
             match result {
                 Ok(hash) => {
-                    // 确保向量有足够的空间
-                    if hashes_lock.len() <= idx {
-                        hashes_lock.resize_with(idx + 1, || {
-                            HashResult {
-                                hash: String::new(),
-                                width: 0,
-                                height: 0,
-                            }
-                        });
-                    }
-                    hashes_lock[idx] = hash;
+                    results_lock[idx] = Some(hash);
                 },
                 Err(e) => {
                     *error_lock += 1;
@@ -109,25 +99,30 @@ fn compute_image_hashes(
     });
     
     // 获取最终结果
-    let final_hashes = Arc::try_unwrap(hashes)
+    let final_results = Arc::try_unwrap(results)
         .expect("无法获取锁")
         .into_inner()
         .expect("锁被毒化");
     
     let final_error_count = *error_count.lock().unwrap();
     
-    // 过滤掉空哈希值（处理失败的图像对应位置）
-    let valid_hashes: Vec<HashResult> = final_hashes.into_iter()
-        .filter(|h| !h.hash.is_empty())
+    // 将Option<HashResult>转换为HashResult，对于None的情况使用空哈希值
+    let valid_hashes: Vec<HashResult> = final_results.into_iter()
+        .map(|opt_result| opt_result.unwrap_or_else(|| HashResult {
+            hash: String::new(),
+            width: 0,
+            height: 0,
+        }))
         .collect();
     
-    if !valid_hashes.is_empty() {
-        if final_error_count > 0 {
-            eprintln!("注意: {} 个图像处理失败，已忽略", final_error_count);
-        }
-        Ok(valid_hashes)
-    } else {
+    if final_error_count > 0 {
+        eprintln!("注意: {} 个图像处理失败", final_error_count);
+    }
+    
+    if valid_hashes.is_empty() {
         Err("所有图像处理均失败".to_string())
+    } else {
+        Ok(valid_hashes)
     }
 }
 

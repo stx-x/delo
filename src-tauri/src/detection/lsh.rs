@@ -20,20 +20,20 @@ pub struct LSHIndex {
 impl LSHIndex {
     /// 创建新的LSH索引
     pub fn new(algorithm: HashAlgorithm) -> Self {
-        // 根据算法类型选择合适的段数
-        let bands = match algorithm {
-            HashAlgorithm::Exact => 1,    // 精确匹配使用单一段
-            HashAlgorithm::ORB => 6,      // 增加ORB算法的段数以提高准确性
-            HashAlgorithm::Average => 4,   // 均值哈希使用中等数量的段
-            HashAlgorithm::Difference => 4, // 差值哈希使用中等数量的段
-            HashAlgorithm::Perceptual => 6, // 感知哈希使用更多段以提高准确性
+        // 根据算法类型选择合适的段数和桶大小
+        let (bands, max_bucket_size) = match algorithm {
+            HashAlgorithm::Exact => (1, 1000),    // 精确匹配使用较小的桶
+            HashAlgorithm::ORB => (8, 3000),      // ORB需要更大的桶来处理特征匹配
+            HashAlgorithm::Average => (4, 2000),   // 均值哈希使用中等大小
+            HashAlgorithm::Difference => (4, 2000), // 差值哈希使用中等大小
+            HashAlgorithm::Perceptual => (6, 2000), // 感知哈希使用较多的段
         };
         
         Self {
-            buckets: HashMap::with_capacity(2000), // 增加初始容量
+            buckets: HashMap::with_capacity(2000),
             bands,
             algorithm,
-            max_bucket_size: 2000, // 增加默认桶大小
+            max_bucket_size,
         }
     }
     
@@ -78,9 +78,28 @@ impl LSHIndex {
             return Vec::new();
         }
         
-        // 对不同算法使用专门的查询策略
-        let bands = match self.algorithm {
+        let bands = self.get_hash_bands(hash);
+        let mut candidates = HashSet::with_capacity(bands.len() * self.max_bucket_size / 4);
+        
+        // 收集所有候选索引
+        for band in bands {
+            if let Some(indices) = self.buckets.get(&band) {
+                candidates.extend(indices.iter().copied());
+            }
+        }
+        
+        candidates.into_iter().collect()
+    }
+    
+    /// 获取哈希值的LSH段
+    fn get_hash_bands(&self, hash: &str) -> Vec<String> {
+        if hash.is_empty() {
+            return Vec::new();
+        }
+        
+        match self.algorithm {
             HashAlgorithm::ORB => {
+                // 对ORB特征使用特殊的分段策略
                 let signature_len = if hash.len() > 256 { 256 } else { hash.len() };
                 let signature = &hash[0..signature_len];
                 
@@ -92,90 +111,75 @@ impl LSHIndex {
                 }
             },
             _ => split_hash_for_lsh(hash, self.bands),
-        };
-        
-        // 使用预分配的HashSet提高性能
-        let mut candidates = HashSet::with_capacity(
-            bands.iter()
-                .filter_map(|band| self.buckets.get(band))
-                .map(|indices| indices.len())
-                .sum()
-        );
-        
-        // 优化的查询处理
-        if bands.len() > 2 {
-            // 并行收集所有匹配的索引
-            let parallel_results: Vec<Vec<usize>> = bands.par_iter()
-                .filter_map(|band| self.buckets.get(band))
-                .map(|indices| indices.to_vec())
-                .collect();
-                
-            // 串行合并结果
-            for indices in parallel_results {
-                candidates.extend(indices);
-            }
-        } else {
-            // 对于小数据量直接串行处理
-            for band in bands {
-                if let Some(indices) = self.buckets.get(&band) {
-                    candidates.extend(indices);
-                }
-            }
         }
-        
-        candidates.into_iter().collect()
     }
     
     /// 批量添加哈希值到索引中
     pub fn batch_add(&mut self, hashes: &[String], start_index: usize) {
+        if hashes.is_empty() {
+            return;
+        }
+
         // 优化的批量处理策略
-        if hashes.len() > 1000 {
-            // 动态调整批次大小
-            let batch_size = (hashes.len() / rayon::current_num_threads()).max(500);
-            let batches: Vec<_> = hashes.chunks(batch_size).collect();
-            
-            // 并行处理每个批次
-            let partial_indices: Vec<_> = batches
-                .into_par_iter()
-                .enumerate()
-                .map(|(batch_idx, batch_hashes)| {
-                    let mut local_lsh = LSHIndex::new(self.algorithm);
-                    // 预分配空间
-                    local_lsh.buckets = HashMap::with_capacity(batch_hashes.len() / 2);
-                    
-                    for (i, hash) in batch_hashes.iter().enumerate() {
+        let batch_size = if hashes.len() > 1000 {
+            (hashes.len() / rayon::current_num_threads()).max(500)
+        } else {
+            hashes.len()
+        };
+
+        // 并行处理批次
+        let partial_indices: Vec<_> = hashes
+            .par_chunks(batch_size)
+            .enumerate()
+            .map(|(batch_idx, batch_hashes)| {
+                let mut local_buckets = HashMap::with_capacity(batch_hashes.len() / 2);
+                
+                for (i, hash) in batch_hashes.iter().enumerate() {
+                    if !hash.is_empty() {
                         let idx = start_index + batch_idx * batch_size + i;
-                        local_lsh.add(hash, idx);
-                    }
-                    local_lsh
-                })
-                .collect();
-            
-            // 优化合并过程
-            let mut new_buckets = HashMap::with_capacity(self.buckets.len() + hashes.len() / 2);
-            for local_lsh in partial_indices {
-                for (band, indices) in local_lsh.buckets {
-                    let bucket = new_buckets.entry(band).or_insert_with(Vec::new);
-                    bucket.extend(indices);
-                    // 动态调整桶大小
-                    if bucket.len() > self.max_bucket_size * 2 {
-                        bucket.sort_unstable();
-                        bucket.dedup();
-                        if bucket.len() > self.max_bucket_size {
-                            bucket.truncate(self.max_bucket_size);
+                        let bands = self.get_hash_bands(hash);
+                        
+                        for band in bands {
+                            local_buckets.entry(band)
+                                .or_insert_with(Vec::new)
+                                .push(idx);
                         }
                     }
                 }
-            }
-            
-            // 替换原有的桶
-            self.buckets = new_buckets;
-        } else {
-            // 小批量直接处理
-            for (i, hash) in hashes.iter().enumerate() {
-                self.add(hash, start_index + i);
+                
+                local_buckets
+            })
+            .collect();
+
+        // 优化的合并过程
+        let mut new_buckets = HashMap::with_capacity(self.buckets.len() + hashes.len() / 2);
+        
+        // 首先合并现有的桶
+        for (band, indices) in self.buckets.drain() {
+            new_buckets.insert(band, indices);
+        }
+        
+        // 合并新的批次结果
+        for local_buckets in partial_indices {
+            for (band, mut indices) in local_buckets {
+                let bucket = new_buckets.entry(band).or_insert_with(Vec::new);
+                bucket.append(&mut indices);
+                
+                // 动态调整桶大小
+                if bucket.len() > self.max_bucket_size {
+                    bucket.sort_unstable();
+                    bucket.dedup();
+                    if bucket.len() > self.max_bucket_size {
+                        // 保留最新的索引
+                        let start = bucket.len() - self.max_bucket_size;
+                        bucket.copy_within(start.., 0);
+                        bucket.truncate(self.max_bucket_size);
+                    }
+                }
             }
         }
+        
+        self.buckets = new_buckets;
     }
     
     /// 清空索引
