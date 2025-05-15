@@ -26,6 +26,17 @@ const state = ref({
         totalImages: 0,
         processedImages: 0,
     },
+    // 新增完成信息相关状态
+    showCompletionInfo: false,
+    completionInfo: {
+        deletedImages: 0,
+        savedSpace: '0 B',
+        timestamp: ''
+    },
+    // 删除进度相关状态
+    isDeleting: false,
+    deleteProgress: 0,
+    totalToDelete: 0
 });
 
 // 设置面板状态
@@ -33,6 +44,8 @@ const showSettings = ref(false);
 const newAlgorithm = ref(globalState.algorithm || 'Exact');
 const newThreshold = ref(globalState.similarityThreshold || 80);
 const newFolders = ref([...globalState.selectedFolders || []]);
+// 分组折叠状态
+const collapsedGroups = ref({});
 // 默认始终递归扫描子文件夹
 const newRecursive = ref(true);
 const isRescanning = ref(false);
@@ -481,45 +494,65 @@ const toggleCurrentImageSelection = () => {
 
 // 删除当前预览的图片
 const deleteCurrentImage = async () => {
+    if (!state.value.previewImage) return;
+
+    const { path, size_bytes } = state.value.previewImage;
+    const formattedSize = formatSize(size_bytes);
+
     if (
         !(await window.__TAURI__.dialog.confirm(
-            "确定要删除当前图片吗？此操作不可恢复！",
+            `确定要删除当前图片吗？\n文件大小: ${formattedSize}\n路径: ${path}\n\n此操作不可恢复！`,
         ))
     ) {
         return;
     }
 
-    const path = state.value.previewImage.path;
-
     try {
-        // 调用 Tauri 删除文件
+        // 删除文件
         await window.__TAURI__.fs.remove(path);
 
-        // 更新界面，移除已删除的图片
-        const group =
-            state.value.duplicateGroups[state.value.currentGroupIndex];
-        group.images = group.images.filter((image) => image.path !== path);
+        // 更新界面
+        const { currentGroupIndex, currentImageIndex } = state.value;
+        const currentGroup = state.value.duplicateGroups[currentGroupIndex];
 
-        // 如果组中只剩一张图片，关闭预览并过滤掉该组
-        if (group.images.length <= 1) {
-            state.value.duplicateGroups = state.value.duplicateGroups.filter(
-                (_, index) => index !== state.value.currentGroupIndex,
+        if (currentGroup) {
+            // 从当前组中移除该图片
+            currentGroup.images = currentGroup.images.filter(
+                (img) => img.path !== path,
             );
-            closePreview();
-            state.value.processingStatus =
-                "已成功删除图片，该组中的重复图片已全部处理";
-            return;
+
+            // 如果组中还有图片，切换到下一张
+            if (currentGroup.images.length > 0) {
+                // 如果删除的是最后一张，切换到第一张
+                if (currentImageIndex >= currentGroup.images.length) {
+                    state.value.currentImageIndex = 0;
+                }
+                state.value.previewImage = processImageMetadata(
+                    currentGroup.images[state.value.currentImageIndex],
+                );
+            } else {
+                // 如果组中没有图片了，关闭预览
+                closePreview();
+                // 从分组列表中移除该组
+                state.value.duplicateGroups = state.value.duplicateGroups.filter(
+                    (_, index) => index !== currentGroupIndex,
+                );
+            }
         }
 
-        // 调整当前索引
-        if (state.value.currentImageIndex >= group.images.length) {
-            state.value.currentImageIndex = group.images.length - 1;
+        // 如果所有重复组都已经处理完成，显示完成页面
+        if (state.value.duplicateGroups.length === 0) {
+            // 清除统计信息，显示完成页面
+            state.value.showCompletionInfo = true;
+            state.value.completionInfo = {
+                deletedImages: 1, // 单张图片
+                savedSpace: formattedSize,
+                timestamp: new Date().toLocaleString()
+            };
+        } else {
+            // 如果还有重复组，更新提示
+            state.value.processingStatus = `已成功删除图片，节省了 ${formattedSize} 的存储空间`;
         }
-
-        // 更新预览图片
-        state.value.previewImage = group.images[state.value.currentImageIndex];
-
-        state.value.processingStatus = "已成功删除图片";
     } catch (err) {
         console.error("删除图片时出错:", err);
         state.value.processingStatus = `删除图片时出错: ${err}`;
@@ -570,25 +603,52 @@ const deleteSelectedImages = async () => {
 
     // 获取选中图片的路径，用于提示用户
     const imagePaths = getSelectedImagePaths();
+    
+    // 计算选中图片的总大小
+    let totalSize = 0;
+    for (const groupIndex in state.value.selectedImages) {
+        const group = state.value.duplicateGroups[groupIndex];
+        if (group && group.images) {
+            for (const imageIndex in state.value.selectedImages[groupIndex]) {
+                if (state.value.selectedImages[groupIndex][imageIndex]) {
+                    const image = group.images[imageIndex];
+                    if (image && image.size_bytes) {
+                        totalSize += image.size_bytes;
+                    }
+                }
+            }
+        }
+    }
+    
+    const formattedSize = formatSize(totalSize);
 
     if (
         !(await window.__TAURI__.dialog.confirm(
-            `确定要删除选中的 ${imagePaths.length} 张图片吗？此操作不可恢复！`,
+            `确定要删除选中的 ${imagePaths.length} 张图片吗？\n此操作将节省约 ${formattedSize} 的存储空间，但不可恢复！`,
         ))
     ) {
         return;
     }
 
-    // 提示用户正在删除图片
+    // 设置删除状态和进度
+    state.value.isDeleting = true;
+    state.value.deleteProgress = 0;
+    state.value.totalToDelete = imagePaths.length;
     state.value.processingStatus = `正在删除 ${imagePaths.length} 张图片...`;
 
     try {
         // 调用 Tauri 删除文件
-        for (const path of imagePaths) {
+        for (let i = 0; i < imagePaths.length; i++) {
+            const path = imagePaths[i];
             await window.__TAURI__.fs.remove(path);
+            
+            // 更新进度
+            state.value.deleteProgress = i + 1;
+            state.value.processingStatus = `正在删除 (${i + 1}/${imagePaths.length}) 张图片...`;
+            
+            // 等待一小段时间以显示进度动画
+            await new Promise(resolve => setTimeout(resolve, 100));
         }
-
-        state.value.processingStatus = `已成功删除 ${imagePaths.length} 张图片`;
 
         // 更新界面，移除已删除的图片
         state.value.duplicateGroups = state.value.duplicateGroups
@@ -602,6 +662,23 @@ const deleteSelectedImages = async () => {
 
         // 重置选择状态
         state.value.selectedImages = {};
+        
+        // 重置删除状态
+        state.value.isDeleting = false;
+        
+        // 如果所有重复组都已经处理完成，显示完成页面
+        if (state.value.duplicateGroups.length === 0) {
+            // 清除统计信息，显示完成页面
+            state.value.showCompletionInfo = true;
+            state.value.completionInfo = {
+                deletedImages: imagePaths.length,
+                savedSpace: formattedSize,
+                timestamp: new Date().toLocaleString()
+            };
+        } else {
+            // 如果还有重复组，更新提示
+            state.value.processingStatus = `已成功删除 ${imagePaths.length} 张图片，节省了 ${formattedSize} 的存储空间`;
+        }
     } catch (err) {
         console.error("删除图片时出错:", err);
         state.value.processingStatus = `删除图片时出错: ${err}`;
@@ -763,6 +840,15 @@ const getCriteriaName = (criteria) => {
         newest: "修改时间",
     };
     return names[criteria] || criteria;
+};
+
+// 切换分组折叠状态
+const toggleGroupCollapse = (groupIndex) => {
+    if (collapsedGroups.value[groupIndex]) {
+        delete collapsedGroups.value[groupIndex];
+    } else {
+        collapsedGroups.value[groupIndex] = true;
+    }
 };
 
 // 格式化日期
@@ -940,10 +1026,18 @@ const processGroup = (group) => {
                 leave-from-class="opacity-100 scale-100 translate-y-0"
                 leave-to-class="opacity-0 scale-95 translate-y-2"
             >
-                <div v-if="showSettings" class="absolute top-14 right-0 w-80 bg-white rounded-xl shadow-xl border border-slate-200 overflow-hidden">
-                    <div class="p-4 bg-slate-50 border-b border-slate-200">
-                        <h3 class="text-lg font-semibold text-slate-800">调整扫描参数</h3>
-                        <p class="text-sm text-slate-600">修改后点击"重新扫描"应用更改</p>
+                <div v-if="showSettings" class="absolute top-14 right-0 w-96 bg-gradient-to-br from-white to-blue-50 rounded-2xl shadow-2xl border border-blue-100 overflow-hidden transform transition-all duration-300 ease-in-out">
+                    <div class="p-5 bg-gradient-to-r from-blue-50 to-indigo-50 border-b border-blue-100">
+                        <div class="flex items-center gap-3 mb-1">
+                            <div class="bg-blue-100 p-2 rounded-lg">
+                                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-blue-600">
+                                    <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"></path>
+                                    <circle cx="12" cy="12" r="3"></circle>
+                                </svg>
+                            </div>
+                            <h3 class="text-xl font-bold text-blue-800">重新扫描设置</h3>
+                        </div>
+                        <p class="text-sm text-blue-700 ml-12">调整参数后点击"重新扫描"应用更改</p>
                     </div>
                     <div class="p-4">
                         <!-- 算法选择 -->
@@ -979,18 +1073,27 @@ const processGroup = (group) => {
                         </div>
                         
                         <!-- 相似度阈值 -->
-                        <div class="mb-4" v-if="newAlgorithm !== 'Exact'">
-                            <label class="block text-sm font-medium text-slate-700 mb-2">
-                                相似度阈值: {{ newThreshold }}%
+                        <div class="mb-6" v-if="newAlgorithm !== 'Exact'">
+                            <label class="flex justify-between items-center text-sm font-medium text-slate-700 mb-2">
+                                <span class="flex items-center gap-1.5">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-blue-500">
+                                        <path d="m8 3 4 8 5-5 5 15H2L8 3z"></path>
+                                    </svg>
+                                    相似度阈值
+                                </span>
+                                <span class="text-blue-600 font-semibold bg-blue-50 px-2 py-0.5 rounded-md">{{ newThreshold }}%</span>
                             </label>
-                            <input 
-                                type="range" 
-                                v-model="newThreshold" 
-                                min="0" 
-                                max="100" 
-                                step="1"
-                                class="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer"
-                            />
+                            <div class="relative mt-3">
+                                <div class="absolute inset-0 h-2 bg-gradient-to-r from-blue-200 to-blue-500 rounded-lg opacity-30"></div>
+                                <input 
+                                    type="range" 
+                                    v-model="newThreshold" 
+                                    min="0" 
+                                    max="100" 
+                                    step="1"
+                                    class="relative w-full h-2 bg-transparent appearance-none cursor-pointer z-10"
+                                />
+                            </div>
                         </div>
                         
                         <!-- 文件夹选择 -->
@@ -1048,16 +1151,16 @@ const processGroup = (group) => {
                         <!-- 移除递归选项，默认递归扫描 -->
                         
                         <!-- 操作按钮 -->
-                        <div class="flex justify-between mt-6">
+                        <div class="flex justify-between mt-8">
                             <button 
                                 @click="showSettings = false"
-                                class="px-4 py-2 bg-slate-100 text-slate-700 rounded-lg hover:bg-slate-200 transform hover:-translate-y-0.5 active:translate-y-0 transition-all duration-300 shadow-sm"
+                                class="px-5 py-2.5 bg-white border border-slate-200 text-slate-700 rounded-xl hover:bg-slate-50 hover:text-slate-900 hover:border-slate-300 transform hover:-translate-y-0.5 active:translate-y-0 transition-all duration-300 shadow-sm font-medium"
                             >
                                 取消
                             </button>
                             <button 
                                 @click="rescan"
-                                class="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transform hover:-translate-y-0.5 active:translate-y-0 transition-all duration-300 shadow-sm disabled:bg-blue-300 disabled:cursor-not-allowed disabled:transform-none flex items-center gap-2"
+                                class="px-5 py-2.5 bg-gradient-to-r from-blue-500 to-indigo-600 text-white rounded-xl hover:from-blue-600 hover:to-indigo-700 transform hover:-translate-y-0.5 active:translate-y-0 transition-all duration-300 shadow-md hover:shadow-lg disabled:opacity-70 disabled:cursor-not-allowed disabled:transform-none flex items-center gap-2 font-medium"
                                 :disabled="newFolders.length === 0 || isRescanning"
                             >
                                 <svg v-if="isRescanning" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="animate-spin">
@@ -1096,32 +1199,72 @@ const processGroup = (group) => {
                 <h1 class="text-2xl font-bold text-slate-900">重复图片处理</h1>
             </div>
 
-            <!-- 没有找到重复图片时的提示界面 -->
+            <!-- 没有找到重复图片或已处理完所有重复图片时的提示界面 -->
             <div
-                v-if="!globalState.duplicateGroups?.length"
-                class="flex flex-col items-center justify-center p-16 text-center bg-white rounded-xl shadow-sm"
+                v-if="!globalState.duplicateGroups?.length || state.showCompletionInfo"
+                class="flex flex-col items-center justify-center p-16 text-center bg-gradient-to-br from-white to-blue-50 rounded-2xl shadow-lg border border-blue-100"
             >
-                <svg
-                    xmlns="http://www.w3.org/2000/svg"
-                    width="64"
-                    height="64"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="1"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    class="text-slate-400 mb-6"
-                >
-                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
-                    <circle cx="8.5" cy="8.5" r="1.5" />
-                    <polyline points="21 15 16 10 5 21" />
-                </svg>
-                <p class="text-slate-500 text-lg mb-8">
-                    {{ state.processingStatus }}
-                </p>
+                <!-- 如果是完成删除操作的情况 -->
+                <template v-if="state.showCompletionInfo">
+                    <div class="bg-blue-100 p-4 rounded-full mb-6">
+                        <svg
+                            xmlns="http://www.w3.org/2000/svg"
+                            width="64"
+                            height="64"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2"
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                            class="text-blue-600"
+                        >
+                            <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path>
+                            <polyline points="22 4 12 14.01 9 11.01"></polyline>
+                        </svg>
+                    </div>
+                    <h2 class="text-2xl font-bold text-blue-800 mb-4">操作完成！</h2>
+                    <div class="bg-white p-6 rounded-xl shadow-md mb-8 w-full max-w-md">
+                        <div class="flex items-center justify-between mb-4 pb-4 border-b border-slate-100">
+                            <span class="text-slate-600 font-medium">已删除图片：</span>
+                            <span class="text-blue-600 font-bold text-lg">{{ state.completionInfo.deletedImages }} 张</span>
+                        </div>
+                        <div class="flex items-center justify-between mb-4 pb-4 border-b border-slate-100">
+                            <span class="text-slate-600 font-medium">节省空间：</span>
+                            <span class="text-green-600 font-bold text-lg">{{ state.completionInfo.savedSpace }}</span>
+                        </div>
+                        <div class="flex items-center justify-between">
+                            <span class="text-slate-600 font-medium">完成时间：</span>
+                            <span class="text-slate-600">{{ state.completionInfo.timestamp }}</span>
+                        </div>
+                    </div>
+                </template>
+                
+                <!-- 如果是没有找到重复图片的情况 -->
+                <template v-else>
+                    <svg
+                        xmlns="http://www.w3.org/2000/svg"
+                        width="64"
+                        height="64"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        class="text-slate-400 mb-6"
+                    >
+                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+                        <circle cx="8.5" cy="8.5" r="1.5" />
+                        <polyline points="21 15 16 10 5 21" />
+                    </svg>
+                    <p class="text-slate-500 text-lg mb-8">
+                        {{ state.processingStatus }}
+                    </p>
+                </template>
+                
                 <button
-                    class="mx-auto mb-4 flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-xl font-semibold shadow-lg hover:bg-blue-700 transition-all transform hover:-translate-y-1 active:translate-y-0"
+                    class="mx-auto flex items-center gap-2 px-6 py-3 bg-gradient-to-r from-blue-500 to-indigo-600 text-white rounded-xl font-semibold shadow-lg hover:shadow-xl transition-all transform hover:-translate-y-1 active:translate-y-0"
                     @click="goBack"
                 >
                     <svg
@@ -1314,9 +1457,10 @@ const processGroup = (group) => {
                         <button
                             class="flex items-center gap-2 px-4 py-2 bg-red-500 text-white rounded-lg font-medium transition-all hover:bg-red-600 disabled:bg-red-300 disabled:cursor-not-allowed transform hover:-translate-y-0.5 active:translate-y-0 duration-300"
                             @click="deleteSelectedImages"
-                            :disabled="selectedCount === 0"
+                            :disabled="selectedCount === 0 || state.isDeleting"
                         >
                             <svg
+                                v-if="!state.isDeleting"
                                 xmlns="http://www.w3.org/2000/svg"
                                 width="16"
                                 height="16"
@@ -1335,8 +1479,40 @@ const processGroup = (group) => {
                                     d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"
                                 />
                             </svg>
-                            删除选中的图片 ({{ selectedCount }})
+                            <svg 
+                                v-if="state.isDeleting" 
+                                class="animate-spin h-4 w-4" 
+                                xmlns="http://www.w3.org/2000/svg" 
+                                fill="none" 
+                                viewBox="0 0 24 24"
+                            >
+                                <circle 
+                                    class="opacity-25" 
+                                    cx="12" 
+                                    cy="12" 
+                                    r="10" 
+                                    stroke="currentColor" 
+                                    stroke-width="4"
+                                ></circle>
+                                <path 
+                                    class="opacity-75" 
+                                    fill="currentColor" 
+                                    d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                                ></path>
+                            </svg>
+                            {{ state.isDeleting ? `删除中 (${state.deleteProgress}/${state.totalToDelete})` : `删除选中的图片 (${selectedCount})` }}
                         </button>
+                        
+                        <!-- 删除进度条 -->
+                        <div v-if="state.isDeleting" class="w-full mt-4 bg-gray-100 rounded-full h-2.5 overflow-hidden">
+                            <div 
+                                class="bg-gradient-to-r from-blue-500 to-green-500 h-2.5 rounded-full transition-all duration-300 ease-out"
+                                :style="{ width: `${(state.deleteProgress / state.totalToDelete) * 100}%` }"
+                            ></div>
+                            <div class="text-xs text-center mt-1 text-gray-500">
+                                {{ Math.round((state.deleteProgress / state.totalToDelete) * 100) }}% 完成
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1368,6 +1544,26 @@ const processGroup = (group) => {
                             </h4>
                             <div class="flex items-center gap-2">
                                 <button
+                                    class="flex items-center justify-center w-8 h-8 bg-slate-100 rounded-lg text-sm transition-all hover:bg-slate-200 hover:text-blue-600"
+                                    @click="toggleGroupCollapse(groupIndex)"
+                                    title="折叠/展开此分组"
+                                >
+                                    <svg
+                                        xmlns="http://www.w3.org/2000/svg"
+                                        width="16"
+                                        height="16"
+                                        viewBox="0 0 24 24"
+                                        fill="none"
+                                        stroke="currentColor"
+                                        stroke-width="2"
+                                        stroke-linecap="round"
+                                        stroke-linejoin="round"
+                                    >
+                                        <path v-if="collapsedGroups[groupIndex]" d="m9 18 6-6-6-6"></path>
+                                        <path v-else d="m6 9 6 6 6-6"></path>
+                                    </svg>
+                                </button>
+                                <button
                                     class="flex items-center gap-2 px-3 py-2 bg-slate-100 rounded-lg text-sm transition-all hover:bg-slate-200"
                                     @click="toggleGroupSelection(groupIndex)"
                                 >
@@ -1395,7 +1591,8 @@ const processGroup = (group) => {
                         </div>
 
                         <div
-                            class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 p-6"
+                            v-if="!collapsedGroups[groupIndex]"
+                            class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 p-6 transition-all duration-300"
                         >
                             <div
                                 v-for="(image, imageIndex) in group.images"
@@ -1635,6 +1832,7 @@ const processGroup = (group) => {
                         </svg>
                     </button>
                 </div>
+
                 <div
                     class="p-6 overflow-y-auto flex-1 flex flex-col items-center"
                 >
