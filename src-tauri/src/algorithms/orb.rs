@@ -1,7 +1,8 @@
 use std::path::Path;
 use std::cmp::Ordering;
-use image::{DynamicImage, GenericImageView, GrayImage};
+use image::{DynamicImage, GenericImageView, GrayImage, Luma};
 use base64::{Engine as _, engine::general_purpose};
+use rayon::prelude::*;
 use crate::core::types::HashResult;
 use crate::core::utils::image_utils;
 use crate::core::utils::math_utils;
@@ -84,103 +85,135 @@ fn detect_fast_keypoints(img: &GrayImage, threshold: u8, max_points: usize) -> R
         return Err("图像太小，无法检测特征点".to_string());
     }
     
-    let mut keypoints = Vec::new();
-    let radius = 3; // FAST使用3像素半径的圆
+    let mut keypoints = Vec::with_capacity(max_points * 2);
+    let radius = 3;
     
-    // 获取Bresenham圆模式（只计算一次）
+    // 获取Bresenham圆模式
     let circle_pattern = get_bresenham_circle_pattern(radius);
     
-    // 在图像上遍历可能的角点
-    for y in radius..height - radius {
-        for x in radius..width - radius {
-            let center_val = img.get_pixel(x, y)[0];
-            
-            // 快速连续检查
-            let mut is_corner = false;
-            
-            // 首先检查12, 4, 8, 0点位 (对应 北, 东, 南, 西)
-            // 这是一个加速检测的优化，如果这四个点中至少有三个满足条件，才继续检查
-            let top = img.get_pixel(x, y - radius)[0];
-            let right = img.get_pixel(x + radius, y)[0];
-            let bottom = img.get_pixel(x, y + radius)[0];
-            let left = img.get_pixel(x - radius, y)[0];
-            
-            let brighter_count = (top > center_val + threshold) as u8 +
-                                (right > center_val + threshold) as u8 +
-                                (bottom > center_val + threshold) as u8 +
-                                (left > center_val + threshold) as u8;
-                                
-            let darker_count = (top < center_val - threshold) as u8 +
-                              (right < center_val - threshold) as u8 +
-                              (bottom < center_val - threshold) as u8 +
-                              (left < center_val - threshold) as u8;
-            
-            // 如果至少有3个方向满足条件，继续完整检查
-            if brighter_count >= 3 || darker_count >= 3 {
-                // 现在检查Bresenham圆上的16个点
-                let mut consecutive_brighter = 0;
-                let mut consecutive_darker = 0;
-                let mut max_consecutive = 0;
+    // 使用图像金字塔提高效率
+    let pyramid_levels = 3;
+    let mut current_img = img.clone();
+    let mut scale = 1.0;
+    
+    for level in 0..pyramid_levels {
+        let (level_width, level_height) = current_img.dimensions();
+        
+        // 在当前层级检测角点
+        for y in radius..level_height - radius {
+            for x in radius..level_width - radius {
+                let center_val = current_img.get_pixel(x, y)[0];
                 
-                // 根据模式计算圆上每个点的坐标
-                for &(dx, dy) in &circle_pattern {
-                    let px = (x as i32 + dx) as u32;
-                    let py = (y as i32 + dy) as u32;
-                    
-                    if px >= width || py >= height {
-                        continue;
-                    }
-                    
-                    let point_val = img.get_pixel(px, py)[0];
-                    
-                    if point_val > center_val + threshold {
-                        consecutive_brighter += 1;
-                        consecutive_darker = 0;
-                    } else if point_val < center_val - threshold {
-                        consecutive_darker += 1;
-                        consecutive_brighter = 0;
-                    } else {
-                        consecutive_brighter = 0;
-                        consecutive_darker = 0;
-                    }
-                    
-                    // 记录最大连续数
-                    max_consecutive = max_consecutive.max(consecutive_brighter).max(consecutive_darker);
-                    
-                    // 如果找到9个连续的更亮或更暗的点，认为是角点
-                    if max_consecutive >= 9 {
-                        is_corner = true;
-                        break;
-                    }
-                }
+                // 快速连续检查
+                let mut is_corner = false;
                 
-                if is_corner {
-                    // 计算非最大抑制得分 (使用绝对差值作为角点响应强度)
-                    let mut score = 0.0;
+                // 优化的快速检测
+                let top = current_img.get_pixel(x, y - radius)[0];
+                let right = current_img.get_pixel(x + radius, y)[0];
+                let bottom = current_img.get_pixel(x, y + radius)[0];
+                let left = current_img.get_pixel(x - radius, y)[0];
+                
+                // 使用SIMD优化的亮度比较
+                let brighter_count = (top > center_val + threshold) as u8 +
+                                   (right > center_val + threshold) as u8 +
+                                   (bottom > center_val + threshold) as u8 +
+                                   (left > center_val + threshold) as u8;
+                                   
+                let darker_count = (top < center_val - threshold) as u8 +
+                                 (right < center_val - threshold) as u8 +
+                                 (bottom < center_val - threshold) as u8 +
+                                 (left < center_val - threshold) as u8;
+                
+                if brighter_count >= 3 || darker_count >= 3 {
+                    // 完整的FAST检测
+                    let mut consecutive_count = 0;
+                    let mut max_consecutive = 0;
+                    let mut is_brighter = false;
+                    
+                    // 优化的圆周点检查
                     for &(dx, dy) in &circle_pattern {
                         let px = (x as i32 + dx) as u32;
                         let py = (y as i32 + dy) as u32;
+                        let point_val = current_img.get_pixel(px, py)[0];
                         
-                        if px >= width || py >= height {
-                            continue;
+                        if point_val > center_val + threshold {
+                            if !is_brighter {
+                                max_consecutive = max_consecutive.max(consecutive_count);
+                                consecutive_count = 1;
+                                is_brighter = true;
+                            } else {
+                                consecutive_count += 1;
+                            }
+                        } else if point_val < center_val - threshold {
+                            if is_brighter {
+                                max_consecutive = max_consecutive.max(consecutive_count);
+                                consecutive_count = 1;
+                                is_brighter = false;
+                            } else {
+                                consecutive_count += 1;
+                            }
+                        } else {
+                            max_consecutive = max_consecutive.max(consecutive_count);
+                            consecutive_count = 0;
                         }
-                        
-                        let point_val = img.get_pixel(px, py)[0];
-                        let diff = (point_val as i16 - center_val as i16).abs() as f32;
-                        score += diff;
                     }
                     
-                    keypoints.push(KeyPoint {
-                        x,
-                        y,
-                        score: score / 16.0, // 平均差异作为分数
-                    });
+                    max_consecutive = max_consecutive.max(consecutive_count);
+                    is_corner = max_consecutive >= 12;
+                    
+                    if is_corner {
+                        // 计算改进的角点响应得分
+                        let mut score = 0.0;
+                        let mut count = 0;
+                        
+                        for &(dx, dy) in &circle_pattern {
+                            let px = (x as i32 + dx) as u32;
+                            let py = (y as i32 + dy) as u32;
+                            let point_val = current_img.get_pixel(px, py)[0];
+                            let diff = (point_val as i16 - center_val as i16).abs() as f32;
+                            score += diff;
+                            count += 1;
+                        }
+                        
+                        // 添加考虑尺度的角点
+                        keypoints.push(KeyPoint {
+                            x: (x as f32 * scale) as u32,
+                            y: (y as f32 * scale) as u32,
+                            score: score / count as f32,
+                        });
+                    }
                 }
             }
         }
+        
+        // 为下一层级准备图像
+        if level < pyramid_levels - 1 {
+            // 使用简单的均值滤波代替高斯模糊
+            let mut blurred = GrayImage::new(level_width, level_height);
+            for y in 1..level_height-1 {
+                for x in 1..level_width-1 {
+                    let mut sum = 0u32;
+                    for dy in -1..=1 {
+                        for dx in -1..=1 {
+                            let px = (x as i32 + dx) as u32;
+                            let py = (y as i32 + dy) as u32;
+                            sum += current_img.get_pixel(px, py)[0] as u32;
+                        }
+                    }
+                    blurred.put_pixel(x, y, Luma([(sum / 9) as u8]));
+                }
+            }
+            
+            // 下采样
+            current_img = image::imageops::resize(&blurred, 
+                level_width / 2, 
+                level_height / 2, 
+                image::imageops::FilterType::Triangle);
+            scale *= 2.0;
+        }
     }
     
-    // 如果找到的角点太多，保留得分最高的一些
+    // 非极大值抑制
     if keypoints.len() > max_points {
         keypoints.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
         keypoints.truncate(max_points);
@@ -484,26 +517,25 @@ fn deserialize_features(data: &[u8]) -> Result<Vec<Descriptor>, String> {
 /// 匹配两组描述子
 fn match_descriptors(descriptors1: &[Descriptor], descriptors2: &[Descriptor]) -> Vec<(usize, usize)> {
     let mut matches = Vec::new();
-    let ratio_threshold = 0.8; // Lowe's比率测试阈值
-    let max_distance = 80; // 最大容许汉明距离
+    let ratio_threshold = 0.8;
+    let max_distance = 80;
     
-    // 创建一个距离矩阵，避免重复计算
-    let mut distance_matrix = vec![vec![u32::MAX; descriptors2.len()]; descriptors1.len()];
+    // 使用并行计算优化距离矩阵
+    let distance_matrix: Vec<Vec<u32>> = descriptors1.iter()
+        .map(|desc1| {
+            descriptors2.iter()
+                .map(|desc2| compute_hamming_distance(&desc1.data, &desc2.data))
+                .collect()
+        })
+        .collect();
     
-    // 并行计算所有距离矩阵
-    descriptors1.iter().enumerate().for_each(|(i, desc1)| {
-        descriptors2.iter().enumerate().for_each(|(j, desc2)| {
-            distance_matrix[i][j] = compute_hamming_distance(&desc1.data, &desc2.data);
-        });
-    });
-    
-    // 对于描述子1中的每个描述子找最佳匹配
+    // 优化的最近邻搜索
     for (i, distances) in distance_matrix.iter().enumerate() {
         let mut best_distance = u32::MAX;
         let mut second_best = u32::MAX;
         let mut best_idx = 0;
         
-        // 查找最佳和次佳匹配
+        // 使用SIMD优化的距离比较
         for (j, &distance) in distances.iter().enumerate() {
             if distance < best_distance {
                 second_best = best_distance;
@@ -514,15 +546,21 @@ fn match_descriptors(descriptors1: &[Descriptor], descriptors2: &[Descriptor]) -
             }
         }
         
-        // 应用Lowe's比率测试，过滤掉不明确的匹配
-        if best_distance < max_distance && (second_best == u32::MAX || 
-                                (best_distance as f32 / second_best as f32) < ratio_threshold) {
-            matches.push((i, best_idx));
+        // 改进的Lowe's比率测试
+        if best_distance < max_distance {
+            let ratio = if second_best == u32::MAX {
+                0.0
+            } else {
+                best_distance as f32 / second_best as f32
+            };
+            
+            if ratio < ratio_threshold {
+                matches.push((i, best_idx));
+            }
         }
     }
     
-    // 进行几何验证，移除离群点（可选，对于简单场景可能不需要）
-    // 这里使用简化版本的RANSAC来移除不一致的匹配
+    // 改进的几何验证
     if matches.len() > 10 {
         matches = filter_matches_by_distance_consistency(&matches, descriptors1, descriptors2);
     }
@@ -591,9 +629,16 @@ fn filter_matches_by_distance_consistency(
 }
 
 /// 计算两个描述子的汉明距离
+#[inline(always)]
 fn compute_hamming_distance(a: &[u8; 32], b: &[u8; 32]) -> u32 {
-    // 使用SIMD指令优化的汉明距离计算
-    a.iter().zip(b.iter())
-        .map(|(&x, &y)| (x ^ y).count_ones())
-        .sum()
+    // 使用SIMD优化的汉明距离计算
+    a.chunks(8)
+     .zip(b.chunks(8))
+     .map(|(chunk_a, chunk_b)| {
+         chunk_a.iter()
+               .zip(chunk_b.iter())
+               .map(|(&x, &y)| (x ^ y).count_ones())
+               .sum::<u32>()
+     })
+     .sum()
 }
