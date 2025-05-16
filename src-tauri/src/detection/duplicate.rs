@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use rayon::prelude::*;
 use crate::core::types::{HashAlgorithm, HashResult, DuplicateGroup, ImageInfo};
 use crate::core::utils::file_utils::{get_image_paths, get_file_metadata};
@@ -23,7 +24,11 @@ pub struct DuplicateDetectionParams {
 
 /// 执行重复图像检测
 pub fn detect_duplicates(params: &DuplicateDetectionParams) -> Result<Vec<DuplicateGroup>, String> {
+    // 开始计时
+    let total_start_time = Instant::now();
+    
     // 1. 收集所有图像路径
+    let scan_start_time = Instant::now();
     let mut all_image_paths = Vec::new();
     
     for folder in &params.folders {
@@ -35,20 +40,49 @@ pub fn detect_duplicates(params: &DuplicateDetectionParams) -> Result<Vec<Duplic
         return Ok(Vec::new());
     }
     
+    // 计算图片扫描时间
+    let scan_time = scan_start_time.elapsed();
+    let total_elapsed = total_start_time.elapsed();
+    println!("图片扫描时间: {:?}, 共找到 {} 张图片 (累计耗时: {:?})", 
+             scan_time, all_image_paths.len(), total_elapsed);
+    
+    // 开始计算哈希值的计时
+    let hash_start_time = Instant::now();
+    
     // 2. 计算所有图像的哈希值
-    let image_hashes = compute_image_hashes(&all_image_paths, params.algorithm)?;
+    let image_hashes = compute_image_hashes(&all_image_paths, params.algorithm, total_start_time)?;
+    
+    // 计算哈希计算时间
+    let hash_time = hash_start_time.elapsed();
+    let total_elapsed = total_start_time.elapsed();
+    println!("图片哈希计算时间: {:?}, 共处理 {} 张图片 (累计耗时: {:?})", 
+             hash_time, image_hashes.len(), total_elapsed);
+    
+    // 开始计算相似度的计时
+    let similarity_start_time = Instant::now();
     
     // 3. 根据哈希值找出重复图像
     let duplicate_groups = find_duplicate_groups(
         &all_image_paths,
         &image_hashes,
         params.algorithm,
-        params.threshold
+        params.threshold,
+        total_start_time
     )?;
+    
+    // 计算相似度比较时间
+    let similarity_time = similarity_start_time.elapsed();
+    let total_elapsed = total_start_time.elapsed();
+    println!("图片相似度比较时间: {:?}, 共找到 {} 组重复图片 (累计耗时: {:?})", 
+             similarity_time, duplicate_groups.len(), total_elapsed);
     
     // 4. 按组大小排序，最大的组在最前面
     let mut sorted_groups = duplicate_groups;
     sorted_groups.sort_by(|a, b| b.images.len().cmp(&a.images.len()));
+    
+    // 计算总耗时
+    let total_time = total_start_time.elapsed();
+    println!("总耗时: {:?}", total_time);
     
     Ok(sorted_groups)
 }
@@ -56,7 +90,8 @@ pub fn detect_duplicates(params: &DuplicateDetectionParams) -> Result<Vec<Duplic
 /// 并行计算所有图像的哈希值
 fn compute_image_hashes(
     paths: &[PathBuf],
-    algorithm: HashAlgorithm
+    algorithm: HashAlgorithm,
+    total_start_time: Instant
 ) -> Result<Vec<HashResult>, String> {
     if paths.is_empty() {
         return Ok(Vec::new());
@@ -69,8 +104,18 @@ fn compute_image_hashes(
     let results = Arc::new(Mutex::new(vec![None; paths.len()]));
     let error_count = Arc::new(Mutex::new(0));
     
+    // 记录批处理开始时间
+    let batch_start_time = Instant::now();
+    let batch_count = (paths.len() + BATCH_SIZE - 1) / BATCH_SIZE; // 向上取整
+    
+    let total_elapsed = total_start_time.elapsed();
+    println!("开始计算图像哈希值，共 {} 张图片，分为 {} 批处理 (累计耗时: {:?})", 
+             paths.len(), batch_count, total_elapsed);
+    
     // 分批并行处理
-    paths.chunks(BATCH_SIZE).par_bridge().for_each(|batch| {
+    paths.chunks(BATCH_SIZE).enumerate().par_bridge().for_each(|(batch_idx, batch)| {
+        let local_start_time = Instant::now();
+        
         let batch_results: Vec<(usize, Result<HashResult, String>)> = batch.par_iter().enumerate()
             .map(|(local_idx, path)| {
                 // 计算哈希并记录原始索引
@@ -96,7 +141,17 @@ fn compute_image_hashes(
                 }
             }
         }
+        
+        let local_elapsed = local_start_time.elapsed();
+        let total_elapsed = total_start_time.elapsed();
+        println!("批次 {}/{} 处理完成，耗时: {:?}, 处理了 {} 张图片 (累计耗时: {:?})", 
+                 batch_idx + 1, batch_count, local_elapsed, batch.len(), total_elapsed);
     });
+    
+    let batch_total_time = batch_start_time.elapsed();
+    let total_elapsed = total_start_time.elapsed();
+    println!("所有批次处理完成，总耗时: {:?} (累计耗时: {:?})", 
+             batch_total_time, total_elapsed);
     
     // 获取最终结果
     let final_results = Arc::try_unwrap(results)
@@ -131,7 +186,8 @@ fn find_duplicate_groups(
     paths: &[PathBuf],
     hashes: &[HashResult],
     algorithm: HashAlgorithm,
-    threshold: f32
+    threshold: f32,
+    total_start_time: Instant
 ) -> Result<Vec<DuplicateGroup>, String> {
     if hashes.is_empty() {
         return Ok(Vec::new());
@@ -141,11 +197,22 @@ fn find_duplicate_groups(
         return Err(format!("哈希值({})与路径({})数量不匹配", hashes.len(), paths.len()));
     }
     
+    // 开始LSH候选对生成计时
+    let lsh_start_time = Instant::now();
+    
     // 提取所有哈希字符串用于LSH算法
     let hash_strings: Vec<String> = hashes.iter().map(|h| h.hash.clone()).collect();
     
     // 使用LSH算法快速找到可能的候选对
     let candidate_pairs = compute_candidate_pairs(&hash_strings, algorithm);
+    
+    let lsh_time = lsh_start_time.elapsed();
+    let total_elapsed = total_start_time.elapsed();
+    println!("LSH候选对生成时间: {:?}, 生成了 {} 个候选对 (累计耗时: {:?})", 
+             lsh_time, candidate_pairs.len(), total_elapsed);
+    
+    // 开始相似度计算计时
+    let similarity_calc_start_time = Instant::now();
     
     // 并行计算所有候选对的相似度
     let similarity_results: Vec<((usize, usize), f32)> = candidate_pairs
@@ -158,6 +225,14 @@ fn find_duplicate_groups(
         })
         .filter(|(_, similarity)| *similarity >= threshold)
         .collect();
+    
+    let similarity_calc_time = similarity_calc_start_time.elapsed();
+    let total_elapsed = total_start_time.elapsed();
+    println!("相似度计算时间: {:?}, 共有 {} 对图片相似度超过阈值 (累计耗时: {:?})", 
+             similarity_calc_time, similarity_results.len(), total_elapsed);
+    
+    // 开始分组计时
+    let grouping_start_time = Instant::now();
     
     // 使用并查集算法构建连通分量（相似图像组）
     let mut disjoint_set = DisjointSet::new(hashes.len());
@@ -214,6 +289,11 @@ fn find_duplicate_groups(
             });
         }
     }
+    
+    let grouping_time = grouping_start_time.elapsed();
+    let total_elapsed = total_start_time.elapsed();
+    println!("图片分组时间: {:?}, 共形成 {} 组重复图片 (累计耗时: {:?})", 
+             grouping_time, groups.len(), total_elapsed);
     
     Ok(groups)
 }

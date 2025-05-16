@@ -3,6 +3,7 @@ use crate::detection::duplicate::{
     detect_duplicates, get_all_image_paths, DuplicateDetectionParams,
 };
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tauri::command;
 use walkdir::WalkDir;
 
@@ -21,6 +22,10 @@ pub fn get_image_paths(folder_path: String, recursive: bool) -> Result<Vec<PathB
 /// 查找重复图像
 #[tauri::command(rename_all = "snake_case")]
 pub fn find_duplicates(req: DuplicateDetectionRequest) -> Result<Vec<DuplicateGroup>, String> {
+    // 开始API调用计时
+    let api_start_time = Instant::now();
+    println!("开始处理重复图片检测请求...");
+    
     // 转换参数
     let folder_paths: Vec<PathBuf> = req.folder_paths.iter().map(|p| PathBuf::from(p)).collect();
 
@@ -31,8 +36,34 @@ pub fn find_duplicates(req: DuplicateDetectionRequest) -> Result<Vec<DuplicateGr
         recursive: req.recursive,
     };
 
+    println!("算法: {:?}, 相似度阈值: {}, 递归扫描: {}", 
+             req.algorithm, req.similarity_threshold, req.recursive);
+
     // 执行重复检测
-    detect_duplicates(&params)
+    let result = detect_duplicates(&params);
+    
+    // 计算API总耗时
+    let api_total_time = api_start_time.elapsed();
+    println!("API调用总耗时: {:?}", api_total_time);
+    
+    // 打印结果摘要
+    match &result {
+        Ok(groups) => {
+            let total_images = groups.iter().map(|g| g.images.len()).sum::<usize>();
+            let unique_images = groups.iter()
+                .flat_map(|g| g.images.iter().map(|img| img.path.clone()))
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+                
+            println!("检测完成，找到 {} 组重复图片，共涉及 {} 张图片 (去重后 {} 张不同图片)", 
+                     groups.len(), total_images, unique_images);
+        },
+        Err(e) => {
+            println!("检测失败: {}", e);
+        }
+    }
+    
+    result
 }
 
 /// 获取支持的算法列表
