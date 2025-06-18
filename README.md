@@ -101,7 +101,7 @@ cargo tauri build
 ## 参考文档
 
 - [Tauri 命令行工具参考](https://v2.tauri.app/zh-cn/reference/cli/)
-- [NPM 包管理器介绍]([https://nodejs.org/zh-cn/learn/getting-started/an-introduction-to-the-npm-package-manager#an-introduction-to-the-npm-package-manager)
+- [NPM 包管理器介绍](https://nodejs.org/zh-cn/learn/getting-started/an-introduction-to-the-npm-package-manager#an-introduction-to-the-npm-package-manager)
 - [The Cargo Book](https://doc.rust-lang.org/cargo/)
 - [Node.js 官方安装指南](https://nodejs.org/zh-cn/download)
 - [Rust 官方安装指南](https://www.rust-lang.org/zh-CN/tools/install)
